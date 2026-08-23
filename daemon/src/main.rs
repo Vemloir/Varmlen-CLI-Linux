@@ -25,12 +25,35 @@ fn runtime_paths(uid: u32) -> (PathBuf, PathBuf) {
     )
 }
 
+/// Resolve the desktop owner uid the daemon serves.
+///
+/// `--owner-uid <uid>` exists for headless supervisors (systemd), which have no
+/// pkexec in the picture. When it is absent we fall back to `PKEXEC_UID` so the
+/// GUI's pkexec launch path keeps working unchanged.
+fn owner_uid_arg() -> Result<Option<String>, &'static str> {
+    let mut args = std::env::args().skip(1);
+    let mut found = None;
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--owner-uid=") {
+            found = Some(value.to_string());
+        } else if arg == "--owner-uid" {
+            found = Some(args.next().ok_or("--owner-uid requires a value")?);
+        } else {
+            return Err("usage: varmlend [--owner-uid <uid>]");
+        }
+    }
+    Ok(found)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("varmlend must run as root".into());
     }
-    let owner_uid = parse_owner_uid(std::env::var("PKEXEC_UID").ok().as_deref())?;
+    let owner_uid = match owner_uid_arg()? {
+        Some(uid) => parse_owner_uid(Some(uid.as_str()))?,
+        None => parse_owner_uid(std::env::var("PKEXEC_UID").ok().as_deref())?,
+    };
     let (socket_path, lock_path) = runtime_paths(owner_uid);
 
     fs::create_dir_all("/run/varmlen")?;

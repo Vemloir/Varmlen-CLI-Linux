@@ -35,9 +35,9 @@ impl PeerPolicy {
 
 pub fn parse_owner_uid(value: Option<&str>) -> Result<u32, &'static str> {
     let uid = value
-        .ok_or("PKEXEC_UID is missing")?
+        .ok_or("desktop owner uid is missing (pass --owner-uid or set PKEXEC_UID)")?
         .parse::<u32>()
-        .map_err(|_| "PKEXEC_UID is invalid")?;
+        .map_err(|_| "desktop owner uid is invalid")?;
     if uid == 0 {
         return Err("refusing to authorize root as desktop owner");
     }
