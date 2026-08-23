@@ -21,10 +21,22 @@ serve it. Measured on one machine: **~345 MB of resident memory**.
 | `helper` | `varmlen-net`, the root-invoked network transaction helper. Vendored. |
 | `cli` | `varmlen-cli`, this client. |
 
-## Build and install
+## Install
 
 ```sh
-cargo build --release
+curl -fsSL https://aegisvpn.org/varmlen-cli-linux/install.sh | sh
+sudo systemctl enable --now varmlend@$(id -u)
+```
+
+The installer verifies the release archive against the SHA-256 checksums
+published with it before unpacking anything, and refuses to continue on a
+mismatch. `VARMLEN_VERSION=v0.1.0` pins a specific release. x86_64 and aarch64
+are built; systemd is required.
+
+### From source
+
+```sh
+./scripts/build-release.sh
 sudo ./packaging/install.sh
 sudo systemctl enable --now varmlend@$(id -u)
 ```
@@ -73,15 +85,20 @@ startup cleanup is what repairs that state.
 
 ## Build hygiene
 
-`.cargo/config.toml` remaps `~/.cargo` and `~/.rustup` out of compiled binaries,
-and the release profile strips symbols. Without this, Rust embeds the absolute
-path of every dependency source file (via `file!()` in panic machinery) into the
-binary, which ships the build user's name and home layout, along with an exact
-dependency inventory.
+`scripts/build-release.sh` remaps `$CARGO_HOME` and `$RUSTUP_HOME` out of the
+binaries and then asserts they are gone, failing the build rather than shipping
+one that names the machine it was built on. The release profile strips symbols.
 
-Only those two prefixes need remapping: Cargo compiles workspace members
-themselves through relative paths, so the checkout location never reaches the
-binary and must not be hardcoded here. Verify with:
+Without this, Rust embeds the absolute path of every dependency source file
+(via `file!()` in panic machinery) into the binary, shipping the build user's
+name and home layout along with an exact dependency inventory. Only those two
+prefixes need remapping — Cargo compiles workspace members themselves through
+relative paths, so the checkout location never reaches the binary.
+
+The prefixes are computed from the environment on purpose. Hardcoding them in
+`.cargo/config.toml` works only on the machine that file was written on and
+silently stops matching anywhere else, which is precisely the failure that
+leaks paths without anyone noticing. CI runs the same script.
 
 ```sh
 strings target/release/varmlen-cli | grep -c "$USER"   # expect 0
