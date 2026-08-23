@@ -5,6 +5,8 @@
 //! protocol. They must stay free of GUI dependencies.
 
 pub mod daemon_client;
+pub mod endpoint;
+pub mod fetch;
 pub mod split;
 pub mod subscription;
 pub mod xray;
