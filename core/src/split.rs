@@ -11,11 +11,11 @@
 //! socket, so xray resolves the owning process via /proc), the site dimension
 //! via `domain` rules.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Split-tunnel selection passed from the UI (only enabled entries). Apps and
 /// sites carry INDEPENDENT modes.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SplitInput {
     /// Apps mode: "selective" | "general". Empty → "general" so an uninitialised

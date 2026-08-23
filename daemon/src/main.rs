@@ -5,12 +5,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::net::UnixListener;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::{
     sync::Semaphore,
     time::{sleep, Duration},
 };
 use varmlend::controller::SystemController;
-use varmlend::protocol::ConnectionPhase;
+use varmlend::protocol::{ConnectionPhase, DaemonCommand};
 use varmlend::recovery::{RecoveryManager, SystemCleanupBackend};
 use varmlend::server::{
     parse_owner_uid, serve_connection, CommandHandler, PeerPolicy, MAX_CONCURRENT_CLIENTS,
@@ -95,6 +96,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = monitor.poll_health().await;
         }
     });
+    // Without this the daemon dies with the tunnel's routes, rules and nft
+    // state still installed in the kernel, and the machine is left with no way
+    // out until something starts the daemon again and its startup cleanup runs.
+    // `systemctl stop` must therefore tear the data plane down first.
+    let shutdown = Arc::clone(&controller);
+    tokio::spawn(async move {
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        let mut interrupt = match signal(SignalKind::interrupt()) {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+        let _ = shutdown.handle(DaemonCommand::Disconnect).await;
+        std::process::exit(0);
+    });
+
     let handler: Arc<dyn CommandHandler> = controller;
 
     let policy = PeerPolicy::new(owner_uid);
