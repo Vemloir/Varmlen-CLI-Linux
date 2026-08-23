@@ -3,5 +3,4 @@
 rustflags = [
   "--remap-path-prefix=/home/daniil/.cargo=/cargo",
   "--remap-path-prefix=/home/daniil/.rustup=/rustup",
-  "--remap-path-prefix=/home/daniil/projects/Varmlen-CLI=/build",
 ]

@@ -73,11 +73,15 @@ startup cleanup is what repairs that state.
 
 ## Build hygiene
 
-`.cargo/config.toml` remaps `~/.cargo`, `~/.rustup` and the source directory out
-of compiled binaries, and the release profile strips symbols. Without this, Rust
-embeds the absolute path of every dependency source file (via `file!()` in panic
-machinery) into the binary, which ships the build user's name and home layout,
-along with an exact dependency inventory. Verify with:
+`.cargo/config.toml` remaps `~/.cargo` and `~/.rustup` out of compiled binaries,
+and the release profile strips symbols. Without this, Rust embeds the absolute
+path of every dependency source file (via `file!()` in panic machinery) into the
+binary, which ships the build user's name and home layout, along with an exact
+dependency inventory.
+
+Only those two prefixes need remapping: Cargo compiles workspace members
+themselves through relative paths, so the checkout location never reaches the
+binary and must not be hardcoded here. Verify with:
 
 ```sh
 strings target/release/varmlen-cli | grep -c "$USER"   # expect 0
