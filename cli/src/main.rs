@@ -12,8 +12,12 @@ mod config;
 mod display;
 
 
+use std::sync::Arc;
+
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use varmlen_core::daemon_client::DaemonClient;
 use varmlen_core::endpoint::resolve_server_ips;
@@ -22,15 +26,14 @@ use varmlen_core::label::transport_summary;
 use varmlen_core::split::SplitInput;
 use varmlen_core::subscription::{parse_proxy_uri, VlessServer};
 use varmlen_core::xray::{
-    build_connection_probe_config, build_ping_config, generate_xray_config,
-    ping_placeholder_ports, TUN_MTU_MAX, TUN_MTU_MIN,
+    build_connection_probe_config, build_ping_config, generate_xray_config, ping_placeholder_ports,
 };
 use varmlend::protocol::{
     ConnectRequest, ConnectionMode, DaemonCommand, DaemonState, ProxyPingRequest, TcpPingRequest,
 };
 
 use config::{location_key, Config, Location, Subscription};
-use display::{bold, bytes, date, dim, label};
+use display::{bold, bytes, date, dim, label, redacted_url};
 
 #[derive(Parser)]
 #[command(
@@ -69,9 +72,12 @@ enum Command {
         #[arg(long)]
         clear: bool,
     },
-    /// Change connection settings.
-    #[command(subcommand)]
-    Set(SetCommand),
+    /// Show or change connection settings. Run without arguments to see the
+    /// current values and what each accepts.
+    Set {
+        #[command(subcommand)]
+        action: Option<SetCommand>,
+    },
     /// Measure latency to a location.
     Ping(PingArgs),
     /// Choose which apps and sites go through the tunnel.
@@ -97,18 +103,29 @@ enum SubCommand {
     /// Add a subscription URL and import its locations.
     Add { url: String },
     /// List subscriptions.
-    List,
-    /// Re-fetch every subscription, replacing its locations.
-    Update,
-    /// Remove a subscription (its locations are kept).
-    Remove { url: String },
+    List {
+        /// Print the full URLs. They contain your account token — only do this
+        /// somewhere the output will not be seen or stored.
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Re-fetch subscriptions, replacing their locations.
+    Update {
+        /// Which one, by number from `sub list` or by name. All of them if
+        /// omitted.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        name: Vec<String>,
+    },
+    /// Remove a subscription by number from `sub list` or by name. Its
+    /// locations are kept.
+    Remove {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        name: Vec<String>,
+    },
 }
 
 #[derive(Args)]
 struct PingArgs {
-    /// Probe every configured location instead of just one.
-    #[arg(long)]
-    all: bool,
     /// Measure a plain TCP handshake to the endpoint instead of probing
     /// through the proxy. Faster, but says nothing about the proxy itself.
     #[arg(long)]
@@ -116,9 +133,11 @@ struct PingArgs {
     /// Timeout per probe, in milliseconds.
     #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u32).range(100..=10_000))]
     timeout: u32,
-    /// Location to probe; defaults to the last one connected to.
+    /// What to probe: a location (by number from `list` or by name), a
+    /// subscription name to cover everything in it, or `all`. Defaults to the
+    /// last location connected to.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    name: Vec<String>,
+    target: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -154,22 +173,53 @@ enum ListCommand {
     Clear,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Switch {
+    On,
+    Off,
+}
+
+impl From<Switch> for bool {
+    fn from(value: Switch) -> Self {
+        value == Switch::On
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Mode {
+    /// Route the whole system through the tunnel.
+    Tun,
+    /// Expose a local SOCKS port only; nothing else is redirected.
+    Proxy,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Client {
+    Varmlen,
+    Happ,
+    Incy,
+}
+
 #[derive(Subcommand)]
 enum SetCommand {
-    /// "tun" routes the whole system; "proxy" only exposes a local SOCKS port.
-    Mode { value: String },
-    /// Block traffic if the tunnel drops.
-    Killswitch { value: String },
-    /// Keep LAN reachable while connected.
-    AllowLan { value: String },
-    /// Tunnel MTU (1280-1500).
-    Mtu { value: u32 },
-    /// Which client to present as when fetching subscriptions:
-    /// varmlen, happ or incy. Panels serve different payloads per client.
-    UserAgent { value: String },
+    /// How traffic reaches the tunnel.
+    Mode { value: Mode },
+    /// Block all traffic if the tunnel drops.
+    Killswitch { value: Switch },
+    /// Keep the local network reachable while connected.
+    AllowLan { value: Switch },
+    /// Tunnel MTU. Below 1280 the tunnel stops carrying IPv6; above 1500 the
+    /// path fragments.
+    Mtu {
+        #[arg(value_parser = clap::value_parser!(u32).range(1280..=1500))]
+        value: u32,
+    },
+    /// Which client to present as when fetching subscriptions. Panels serve
+    /// different payloads per client.
+    UserAgent { value: Client },
     /// Show emoji in location names. Turn off for terminals that cannot draw
-    /// them: flags become country codes rather than disappearing.
-    Emoji { value: String },
+    /// them; flags become country codes rather than disappearing.
+    Emoji { value: Switch },
 }
 
 #[tokio::main]
@@ -227,9 +277,12 @@ async fn run() -> Result<()> {
                 _ => println!("(log cleared)"),
             }
         }
-        Command::Set(command) => {
-            settings(&mut config, command)?;
-            config.save()?;
+        Command::Set { action } => {
+            if let Some(action) = action {
+                settings(&mut config, action)?;
+                config.save()?;
+            }
+            print_settings(&config.settings);
         }
         Command::Ping(args) => ping(&config, args).await?,
         Command::Split { action } => {
@@ -318,6 +371,40 @@ async fn connect(config: &mut Config, name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a subscription by its number in `sub list` or by name, so nobody has
+/// to paste a URL that carries their token just to name one.
+fn find_subscription(config: &Config, needle: &str) -> Result<usize> {
+    if let Ok(number) = needle.parse::<usize>() {
+        return number
+            .checked_sub(1)
+            .filter(|index| *index < config.subscriptions.len())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no subscription {number}; there are {}",
+                    config.subscriptions.len()
+                )
+            });
+    }
+    let lowered = needle.to_lowercase();
+    let matches: Vec<usize> = config
+        .subscriptions
+        .iter()
+        .enumerate()
+        .filter(|(_, sub)| {
+            sub.display_name().to_lowercase().contains(&lowered) || sub.url == needle
+        })
+        .map(|(index, _)| index)
+        .collect();
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => bail!("no subscription matches {needle:?}"),
+        many => bail!(
+            "{needle:?} matches {} subscriptions — select by number",
+            many.len()
+        ),
+    }
+}
+
 async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
     match command {
         SubCommand::Add { url } => {
@@ -337,88 +424,138 @@ async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
             config.save()?;
             println!("imported {count} location(s)");
         }
-        SubCommand::List => {
-            for sub in &config.subscriptions {
-                println!("{}", bold(&sub.display_name()));
-                println!("{}", dim(&format!("  {}", sub.url)));
+        SubCommand::List { reveal } => {
+            if config.subscriptions.is_empty() {
+                println!("no subscriptions configured");
+                return Ok(());
+            }
+            for (index, sub) in config.subscriptions.iter().enumerate() {
+                println!("{:>3}  {}", index + 1, bold(&sub.display_name()));
+                let url = if reveal {
+                    sub.url.clone()
+                } else {
+                    redacted_url(&sub.url)
+                };
+                println!("{}", dim(&format!("     {url}")));
+                println!(
+                    "{}",
+                    dim(&format!(
+                        "     {} location(s)",
+                        config
+                            .locations
+                            .iter()
+                            .filter(|l| l.source.as_deref() == Some(sub.url.as_str()))
+                            .count()
+                    ))
+                );
             }
         }
-        SubCommand::Update => {
-            let urls: Vec<String> = config.subscriptions.iter().map(|s| s.url.clone()).collect();
+        SubCommand::Update { name } => {
+            let name = name.join(" ");
+            let urls: Vec<String> = match name.trim() {
+                "" => config.subscriptions.iter().map(|s| s.url.clone()).collect(),
+                needle => vec![config.subscriptions[find_subscription(config, needle)?]
+                    .url
+                    .clone()],
+            };
             if urls.is_empty() {
                 bail!("no subscriptions configured");
             }
             for url in urls {
                 let result = fetch_subscription(url.clone(), config.settings.user_agent.clone())
                     .await
-                    .map_err(|error| anyhow::anyhow!("updating {url}: {error}"))?;
+                    .map_err(|error| {
+                        anyhow::anyhow!("updating {}: {error}", redacted_url(&url))
+                    })?;
                 let count = result.servers.len();
                 merge(config, result.servers, Some(&url));
                 if let Some(sub) = config.subscriptions.iter_mut().find(|s| s.url == url) {
                     sub.meta = result.meta;
                     sub.description = result.description;
                 }
-                println!("{url}: {count} location(s)");
+                let name = config
+                    .subscriptions
+                    .iter()
+                    .find(|s| s.url == url)
+                    .map(|s| s.display_name())
+                    .unwrap_or_else(|| redacted_url(&url));
+                println!("{name}: {count} location(s)");
             }
             config.save()?;
         }
-        SubCommand::Remove { url } => {
-            let before = config.subscriptions.len();
-            config.subscriptions.retain(|sub| sub.url != url);
-            if config.subscriptions.len() == before {
-                bail!("no such subscription");
-            }
+        SubCommand::Remove { name } => {
+            let index = find_subscription(config, name.join(" ").trim())?;
+            let removed = config.subscriptions.remove(index);
             config.save()?;
-            println!("removed");
+            println!("removed {}", removed.display_name());
         }
     }
     Ok(())
 }
 
 fn settings(config: &mut Config, command: SetCommand) -> Result<()> {
-    fn flag(value: &str) -> Result<bool> {
-        match value {
-            "on" | "true" | "yes" => Ok(true),
-            "off" | "false" | "no" => Ok(false),
-            other => bail!("expected on/off, got {other:?}"),
-        }
-    }
     match command {
         SetCommand::Mode { value } => {
-            if value != "tun" && value != "proxy" {
-                bail!("expected \"tun\" or \"proxy\", got {value:?}");
+            config.settings.mode = match value {
+                Mode::Tun => "tun",
+                Mode::Proxy => "proxy",
             }
-            config.settings.mode = value;
+            .to_string();
         }
-        SetCommand::Killswitch { value } => config.settings.killswitch = flag(&value)?,
-        SetCommand::AllowLan { value } => config.settings.allow_lan = flag(&value)?,
-        SetCommand::Mtu { value } => {
-            // Below 1280 the tunnel stops carrying IPv6 rather than fragmenting
-            // it, and above the Ethernet payload limit the path will fragment.
-            if !(TUN_MTU_MIN..=TUN_MTU_MAX).contains(&value) {
-                bail!("MTU must be between {TUN_MTU_MIN} and {TUN_MTU_MAX}");
-            }
-            config.settings.mtu = value;
-        }
-        SetCommand::Emoji { value } => config.settings.emoji = flag(&value)?,
+        SetCommand::Killswitch { value } => config.settings.killswitch = value.into(),
+        SetCommand::AllowLan { value } => config.settings.allow_lan = value.into(),
+        SetCommand::Emoji { value } => config.settings.emoji = value.into(),
         SetCommand::UserAgent { value } => {
-            config.settings.user_agent = match value.as_str() {
-                "varmlen" => None,
-                "happ" | "incy" => Some(value),
-                other => bail!("unknown client {other:?}; expected varmlen, happ or incy"),
+            config.settings.user_agent = match value {
+                Client::Varmlen => None,
+                Client::Happ => Some("happ".to_string()),
+                Client::Incy => Some("incy".to_string()),
             };
         }
+        SetCommand::Mtu { value } => config.settings.mtu = value,
     }
-    println!(
-        "mode={} killswitch={} allow-lan={} mtu={} user-agent={} emoji={}",
-        config.settings.mode,
-        config.settings.killswitch,
-        config.settings.allow_lan,
-        config.settings.mtu,
-        config.settings.user_agent.as_deref().unwrap_or("varmlen"),
-        config.settings.emoji,
-    );
     Ok(())
+}
+
+/// Show every setting with its current value and what it accepts, so the answer
+/// to "what can I put here" comes from the same command that changes it.
+fn print_settings(settings: &config::Settings) {
+    let on_off = |value: bool| if value { "on" } else { "off" };
+    let rows = [
+        ("mode", settings.mode.clone(), "tun | proxy"),
+        (
+            "killswitch",
+            on_off(settings.killswitch).to_string(),
+            "on | off",
+        ),
+        (
+            "allow-lan",
+            on_off(settings.allow_lan).to_string(),
+            "on | off",
+        ),
+        ("mtu", settings.mtu.to_string(), "1280-1500"),
+        (
+            "user-agent",
+            settings
+                .user_agent
+                .clone()
+                .unwrap_or_else(|| "varmlen".to_string()),
+            "varmlen | happ | incy",
+        ),
+        ("emoji", on_off(settings.emoji).to_string(), "on | off"),
+    ];
+    let name_width = rows.iter().map(|(name, _, _)| name.len()).max().unwrap_or(0);
+    let value_width = rows
+        .iter()
+        .map(|(_, value, _)| value.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (name, value, accepts) in rows {
+        println!(
+            "  {name:<name_width$}  {value:<value_width$}  {}",
+            dim(&format!("({accepts})"))
+        );
+    }
 }
 
 /// Accept `.example.com` as a spelling of `*.example.com`.
@@ -451,44 +588,77 @@ enum Section {
 /// with `--all` the interesting result is usually which locations answer at
 /// all, and aborting on the first dead one would hide that.
 async fn ping(config: &Config, args: PingArgs) -> Result<()> {
-    let indices: Vec<usize> = if args.all {
-        (0..config.locations.len()).collect()
-    } else {
-        let name = args.name.join(" ");
-        let name = name.trim();
-        vec![if name.is_empty() {
-            config.active_index().map_err(anyhow::Error::msg)?
-        } else {
-            config.find(name).map_err(anyhow::Error::msg)?
-        }]
-    };
+    let target = args.target.join(" ");
+    let indices = ping_targets(config, target.trim())?;
     if indices.is_empty() {
-        bail!("no locations configured");
+        bail!("nothing to probe");
     }
 
     let names: Vec<String> = indices
         .iter()
-        .map(|index| {
-            label(
-                &config.locations[*index].server.label,
-                config.settings.emoji,
-            )
-        })
+        .map(|index| label(&config.locations[*index].server.label, config.settings.emoji))
         .collect();
     let width = names.iter().map(|name| name.chars().count()).max().unwrap_or(0);
 
-    for (index, name) in indices.into_iter().zip(names) {
-        let server = &config.locations[index].server;
-        print!("{name:<width$}  ", width = width);
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
+    // Probes are independent, and a sequential sweep of a whole subscription is
+    // dominated by the timeouts of whichever locations are down. Proxy probes
+    // each cost the daemon a throwaway xray process, so they run far fewer at a
+    // time than bare handshakes.
+    let limit = if args.tcp { 16 } else { 4 };
+    let permits = Arc::new(Semaphore::new(limit));
+    let mut tasks = JoinSet::new();
+    for (position, index) in indices.iter().enumerate() {
+        let server = config.locations[*index].server.clone();
+        let permits = Arc::clone(&permits);
+        let (tcp, timeout) = (args.tcp, args.timeout);
+        tasks.spawn(async move {
+            let _permit = permits.acquire().await;
+            (position, probe(&server, tcp, timeout).await)
+        });
+    }
 
-        match probe(server, &args).await {
-            Ok(rtt) => println!("{rtt} ms"),
-            Err(error) => println!("{}", dim(&compact(&error))),
+    let mut results: Vec<Option<Result<u32>>> = (0..indices.len()).map(|_| None).collect();
+    while let Some(finished) = tasks.join_next().await {
+        let (position, outcome) = finished?;
+        results[position] = Some(outcome);
+    }
+
+    // Reported in list order rather than by latency, so the number beside a
+    // result is the number to hand to `connect`.
+    for (name, outcome) in names.into_iter().zip(results) {
+        print!("{name:<width$}  ", width = width);
+        match outcome {
+            Some(Ok(rtt)) => println!("{rtt} ms"),
+            Some(Err(error)) => println!("{}", dim(&compact(&error))),
+            None => println!("{}", dim("not probed")),
         }
     }
     Ok(())
+}
+
+/// Resolve what to probe. A location wins over a subscription of the same name,
+/// since numbers and location names are what `list` puts in front of the user.
+fn ping_targets(config: &Config, target: &str) -> Result<Vec<usize>> {
+    if target.eq_ignore_ascii_case("all") {
+        return Ok((0..config.locations.len()).collect());
+    }
+    if target.is_empty() {
+        return Ok(vec![config.active_index().map_err(anyhow::Error::msg)?]);
+    }
+    if let Ok(index) = config.find(target) {
+        return Ok(vec![index]);
+    }
+    let subscription = find_subscription(config, target).map_err(|_| {
+        anyhow::anyhow!("no location or subscription matches {target:?}; try `all`")
+    })?;
+    let url = config.subscriptions[subscription].url.as_str();
+    Ok(config
+        .locations
+        .iter()
+        .enumerate()
+        .filter(|(_, location)| location.source.as_deref() == Some(url))
+        .map(|(index, _)| index)
+        .collect())
 }
 
 /// The daemon wraps a probe failure in several layers of context
@@ -499,12 +669,12 @@ fn compact(error: &anyhow::Error) -> String {
     text.rsplit(": ").next().unwrap_or(&text).to_string()
 }
 
-async fn probe(server: &VlessServer, args: &PingArgs) -> Result<u32> {
-    let command = if args.tcp {
+async fn probe(server: &VlessServer, tcp: bool, timeout: u32) -> Result<u32> {
+    let command = if tcp {
         DaemonCommand::TcpPing(TcpPingRequest {
             host: server.host.clone(),
             port: server.port,
-            timeout_ms: args.timeout,
+            timeout_ms: timeout,
         })
     } else {
         // The daemon reserves real loopback ports and rewrites the template,
@@ -516,7 +686,7 @@ async fn probe(server: &VlessServer, args: &PingArgs) -> Result<u32> {
             socks_port: ports[0],
             socks_ports: ports,
             dns_probe_urls: Vec::new(),
-            timeout_ms: args.timeout,
+            timeout_ms: timeout,
         })
     };
     // A fresh connection per probe: a daemon-side failure must not leave the

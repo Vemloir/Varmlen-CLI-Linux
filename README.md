@@ -66,6 +66,7 @@ varmlen-cli set allow-lan off
 varmlen-cli set mtu 1420          # 1280-1500
 varmlen-cli set user-agent happ   # varmlen | happ | incy
 varmlen-cli set emoji off         # for terminals that cannot draw emoji
+varmlen-cli set                   # show every setting and what it accepts
 ```
 
 `emoji off` is for VTE-based terminals (Ptyxis, GNOME Terminal), which do not
@@ -101,10 +102,15 @@ Latency:
 
 ```sh
 varmlen-cli ping                  # the last location connected to
-varmlen-cli ping Finland          # by name
-varmlen-cli ping --all            # every location
-varmlen-cli ping --all --tcp      # TCP handshake only: much faster, less telling
+varmlen-cli ping Finland          # one location, by number or name
+varmlen-cli ping AegisVPN         # everything in one subscription
+varmlen-cli ping all              # every location
+varmlen-cli ping all --tcp        # TCP handshake only: much faster, less telling
 ```
+
+Probes run concurrently, so a sweep costs about as long as its slowest member
+rather than the sum of every timeout. Results print in `list` order, so the
+number beside one is the number to hand to `connect`.
 
 The default probe goes through the proxy — the daemon starts a throwaway xray
 on ports it reserves itself and times a real request, so the figure includes the
@@ -114,6 +120,20 @@ Neither touches the current connection.
 
 Configuration lives in `~/.config/varmlen/cli.json` (`varmlen-cli config-path`).
 It holds proxy credentials, so it is written `0600` in a `0700` directory.
+
+Subscriptions are named and numbered rather than addressed by URL, and listings
+print the host only:
+
+```sh
+varmlen-cli sub list
+varmlen-cli sub update AegisVPN
+varmlen-cli sub remove 2
+```
+
+A subscription URL's path *is* the account token — anyone holding it can pull
+the account's servers — and terminal output gets screenshotted and pasted into
+bug reports. `sub list --reveal` prints the full URLs when you actually need
+them.
 
 ## Notes
 

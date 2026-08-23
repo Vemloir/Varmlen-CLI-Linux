@@ -163,3 +163,37 @@ mod label_tests {
         assert_eq!(label("Frankfurt 01", false), "Frankfurt 01");
     }
 }
+
+/// A subscription URL with its credential removed.
+///
+/// The path of a subscription URL *is* the account token — anyone holding it
+/// can pull the account's servers. Terminals get screenshotted, scrollback gets
+/// pasted into support chats, and `list` output ends up in bug reports, so the
+/// path never leaves the config file unless it is asked for explicitly.
+pub fn redacted_url(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(url) => match url.host_str() {
+            Some(host) => format!("{}://{host}/\u{2026}", url.scheme()),
+            None => "\u{2026}".to_string(),
+        },
+        Err(_) => "\u{2026}".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::redacted_url;
+
+    #[test]
+    fn the_token_never_survives() {
+        let secret = "EXAMPLE-TOKEN-0000000000000000000";
+        let masked = redacted_url(&format!("https://example.org/sub/{secret}"));
+        assert_eq!(masked, "https://example.org/\u{2026}");
+        assert!(!masked.contains(secret));
+    }
+
+    #[test]
+    fn a_url_that_does_not_parse_reveals_nothing() {
+        assert_eq!(redacted_url("not a url at all"), "\u{2026}");
+    }
+}
