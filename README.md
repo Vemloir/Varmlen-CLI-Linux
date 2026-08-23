@@ -104,9 +104,15 @@ Latency:
 varmlen-cli ping                  # the last location connected to
 varmlen-cli ping Finland          # one location, by number or name
 varmlen-cli ping AegisVPN         # everything in one subscription
+varmlen-cli ping sub 1            # the same, said explicitly
+varmlen-cli sub ping 1            # and the same again, from the sub side
 varmlen-cli ping all              # every location
 varmlen-cli ping all --tcp        # TCP handshake only: much faster, less telling
 ```
+
+A bare name resolves to a location before a subscription, since numbers and
+location names are what `list` shows; `ping sub <n>` says which was meant when
+both would match.
 
 Probes run concurrently, so a sweep costs about as long as its slowest member
 rather than the sum of every timeout. Results print in `list` order, so the

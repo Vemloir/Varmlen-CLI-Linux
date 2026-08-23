@@ -60,7 +60,7 @@ enum Command {
     Add { uri: String },
     /// Remove a location by its number from `list`, or by name.
     Remove {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        #[arg(num_args = 1.., required = true)]
         name: Vec<String>,
     },
     /// Manage subscriptions.
@@ -94,7 +94,7 @@ struct ConnectArgs {
     /// Location to connect to: its number from `list`, or its name. Everything
     /// after `connect` is taken as the name, so it needs no quoting. Omit it to
     /// reuse the last location connected to.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(num_args = 1..)]
     name: Vec<String>,
 }
 
@@ -113,13 +113,15 @@ enum SubCommand {
     Update {
         /// Which one, by number from `sub list` or by name. All of them if
         /// omitted.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(num_args = 1..)]
         name: Vec<String>,
     },
+    /// Measure latency to every location in a subscription.
+    Ping(PingArgs),
     /// Remove a subscription by number from `sub list` or by name. Its
     /// locations are kept.
     Remove {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        #[arg(num_args = 1.., required = true)]
         name: Vec<String>,
     },
 }
@@ -136,7 +138,7 @@ struct PingArgs {
     /// What to probe: a location (by number from `list` or by name), a
     /// subscription name to cover everything in it, or `all`. Defaults to the
     /// last location connected to.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(num_args = 1..)]
     target: Vec<String>,
 }
 
@@ -284,7 +286,7 @@ async fn run() -> Result<()> {
             }
             print_settings(&config.settings);
         }
-        Command::Ping(args) => ping(&config, args).await?,
+        Command::Ping(args) => ping(&config, args, Scope::Auto).await?,
         Command::Split { action } => {
             let section = match action {
                 Some(action) => {
@@ -424,6 +426,7 @@ async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
             config.save()?;
             println!("imported {count} location(s)");
         }
+        SubCommand::Ping(args) => return ping(config, args, Scope::Subscription).await,
         SubCommand::List { reveal } => {
             if config.subscriptions.is_empty() {
                 println!("no subscriptions configured");
@@ -587,9 +590,16 @@ enum Section {
 /// A probe that fails is reported against its location and the run continues:
 /// with `--all` the interesting result is usually which locations answer at
 /// all, and aborting on the first dead one would hide that.
-async fn ping(config: &Config, args: PingArgs) -> Result<()> {
+/// Whether the target names a subscription for certain, or has to be worked out.
+#[derive(Clone, Copy, PartialEq)]
+enum Scope {
+    Auto,
+    Subscription,
+}
+
+async fn ping(config: &Config, args: PingArgs, scope: Scope) -> Result<()> {
     let target = args.target.join(" ");
-    let indices = ping_targets(config, target.trim())?;
+    let indices = ping_targets(config, target.trim(), scope)?;
     if indices.is_empty() {
         bail!("nothing to probe");
     }
@@ -636,9 +646,29 @@ async fn ping(config: &Config, args: PingArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolve what to probe. A location wins over a subscription of the same name,
+/// Resolve what to probe.
+///
+/// With no qualifier a location wins over a subscription of the same name,
 /// since numbers and location names are what `list` puts in front of the user.
-fn ping_targets(config: &Config, target: &str) -> Result<Vec<usize>> {
+/// `ping sub <n>` (and `sub ping <n>`) say which was meant when both would
+/// match, and are also just easier to reach for.
+fn ping_targets(config: &Config, target: &str, scope: Scope) -> Result<Vec<usize>> {
+    let mut scope = scope;
+    let mut target = target;
+
+    if let Some(rest) = target.strip_prefix("sub ") {
+        scope = Scope::Subscription;
+        target = rest.trim();
+    } else if target == "sub" {
+        bail!("name a subscription: `ping sub <number|name>`, or see `sub list`");
+    }
+
+    if scope == Scope::Subscription {
+        if target.is_empty() {
+            bail!("name a subscription: `ping sub <number|name>`, or see `sub list`");
+        }
+        return Ok(subscription_locations(config, target)?);
+    }
     if target.eq_ignore_ascii_case("all") {
         return Ok((0..config.locations.len()).collect());
     }
@@ -648,17 +678,28 @@ fn ping_targets(config: &Config, target: &str) -> Result<Vec<usize>> {
     if let Ok(index) = config.find(target) {
         return Ok(vec![index]);
     }
-    let subscription = find_subscription(config, target).map_err(|_| {
+    subscription_locations(config, target).map_err(|_| {
         anyhow::anyhow!("no location or subscription matches {target:?}; try `all`")
-    })?;
+    })
+}
+
+fn subscription_locations(config: &Config, target: &str) -> Result<Vec<usize>> {
+    let subscription = find_subscription(config, target)?;
     let url = config.subscriptions[subscription].url.as_str();
-    Ok(config
+    let indices: Vec<usize> = config
         .locations
         .iter()
         .enumerate()
         .filter(|(_, location)| location.source.as_deref() == Some(url))
         .map(|(index, _)| index)
-        .collect())
+        .collect();
+    if indices.is_empty() {
+        bail!(
+            "{} has no locations yet — run `sub update {target}`",
+            config.subscriptions[subscription].display_name()
+        );
+    }
+    Ok(indices)
 }
 
 /// The daemon wraps a probe failure in several layers of context
