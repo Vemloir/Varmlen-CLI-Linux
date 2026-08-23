@@ -86,4 +86,4 @@ strings target/release/varmlen-cli | grep -c "$USER"   # expect 0
 ## Licence
 
 GPL-3.0-only, as the upstream desktop client. `daemon/` and `helper/` are
-vendored from [Varmlen-Client-Linux](https://github.com/demented484/Varmlen-Client-Linux).
+vendored from [Varmlen-Client-Linux](https://github.com/Vemloir/Varmlen-Client-Linux).
