@@ -1,0 +1,19 @@
+[package]
+name = "varmlen-net"
+version = "0.3.1"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Root-invoked network transaction helper for the Varmlen daemon"
+
+[[bin]]
+name = "varmlen-net"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+# SO_MARK + SO_BINDTODEVICE for probes that must bypass the tun (traffic routes
+# into the tun by destination, so a plain source bind isn't enough).
+socket2 = { version = "0.5", features = ["all"] }
+# The installed helper runs only as a child of the root-owned daemon. The caps
+# crate remains for harmless compatibility with direct root diagnostics.
+caps = "0.5"
