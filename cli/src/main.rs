@@ -19,8 +19,11 @@ use varmlen_core::daemon_client::DaemonClient;
 use varmlen_core::endpoint::resolve_server_ips;
 use varmlen_core::fetch::fetch_subscription;
 use varmlen_core::label::transport_summary;
+use varmlen_core::split::SplitInput;
 use varmlen_core::subscription::{parse_proxy_uri, VlessServer};
-use varmlen_core::xray::{build_connection_probe_config, generate_xray_config};
+use varmlen_core::xray::{
+    build_connection_probe_config, generate_xray_config, TUN_MTU_MAX, TUN_MTU_MIN,
+};
 use varmlend::protocol::{ConnectRequest, ConnectionMode, DaemonCommand, DaemonState};
 
 use config::{location_key, Config, Location, Subscription};
@@ -66,6 +69,11 @@ enum Command {
     /// Change connection settings.
     #[command(subcommand)]
     Set(SetCommand),
+    /// Choose which apps and sites go through the tunnel.
+    Split {
+        #[command(subcommand)]
+        action: Option<SplitCommand>,
+    },
     /// Print the path of the CLI's config file.
     ConfigPath,
 }
@@ -92,6 +100,39 @@ enum SubCommand {
 }
 
 #[derive(Subcommand)]
+enum SplitCommand {
+    /// Apps, matched on process or binary name.
+    Apps {
+        #[command(subcommand)]
+        action: Option<ListCommand>,
+    },
+    /// Sites, e.g. `example.com` or `*.example.com`.
+    Sites {
+        #[command(subcommand)]
+        action: Option<ListCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ListCommand {
+    /// `selective` tunnels only what is listed; `general` tunnels everything
+    /// except what is listed.
+    Mode { value: String },
+    /// Add entries to the list.
+    Add {
+        #[arg(required = true)]
+        values: Vec<String>,
+    },
+    /// Remove entries from the list.
+    Remove {
+        #[arg(required = true)]
+        values: Vec<String>,
+    },
+    /// Empty the list, leaving the mode alone.
+    Clear,
+}
+
+#[derive(Subcommand)]
 enum SetCommand {
     /// "tun" routes the whole system; "proxy" only exposes a local SOCKS port.
     Mode { value: String },
@@ -99,6 +140,11 @@ enum SetCommand {
     Killswitch { value: String },
     /// Keep LAN reachable while connected.
     AllowLan { value: String },
+    /// Tunnel MTU (1280-1500).
+    Mtu { value: u32 },
+    /// Which client to present as when fetching subscriptions:
+    /// varmlen, happ or incy. Panels serve different payloads per client.
+    UserAgent { value: String },
 }
 
 #[tokio::main]
@@ -159,6 +205,17 @@ async fn run() -> Result<()> {
             settings(&mut config, command)?;
             config.save()?;
         }
+        Command::Split { action } => {
+            let section = match action {
+                Some(action) => {
+                    let section = split(&mut config, action)?;
+                    config.save()?;
+                    Some(section)
+                }
+                None => None,
+            };
+            print_split(&config.split, section);
+        }
         Command::ConfigPath => println!("{}", config::config_path().display()),
     }
     Ok(())
@@ -199,6 +256,7 @@ async fn connect(config: &mut Config, name: Option<&str>) -> Result<()> {
         config.split.clone(),
         config.settings.mode.clone(),
         config.settings.allow_lan,
+        config.settings.mtu,
     )
     .map_err(|error| anyhow::anyhow!("{error}"))?;
     let validation_config = serde_json::to_string(
@@ -236,7 +294,7 @@ async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
             if config.subscriptions.iter().any(|sub| sub.url == url) {
                 bail!("that subscription is already configured");
             }
-            let result = fetch_subscription(url.clone(), None)
+            let result = fetch_subscription(url.clone(), config.settings.user_agent.clone())
                 .await
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
             let count = result.servers.len();
@@ -261,7 +319,7 @@ async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
                 bail!("no subscriptions configured");
             }
             for url in urls {
-                let result = fetch_subscription(url.clone(), None)
+                let result = fetch_subscription(url.clone(), config.settings.user_agent.clone())
                     .await
                     .map_err(|error| anyhow::anyhow!("updating {url}: {error}"))?;
                 let count = result.servers.len();
@@ -304,12 +362,131 @@ fn settings(config: &mut Config, command: SetCommand) -> Result<()> {
         }
         SetCommand::Killswitch { value } => config.settings.killswitch = flag(&value)?,
         SetCommand::AllowLan { value } => config.settings.allow_lan = flag(&value)?,
+        SetCommand::Mtu { value } => {
+            // Below 1280 the tunnel stops carrying IPv6 rather than fragmenting
+            // it, and above the Ethernet payload limit the path will fragment.
+            if !(TUN_MTU_MIN..=TUN_MTU_MAX).contains(&value) {
+                bail!("MTU must be between {TUN_MTU_MIN} and {TUN_MTU_MAX}");
+            }
+            config.settings.mtu = value;
+        }
+        SetCommand::UserAgent { value } => {
+            config.settings.user_agent = match value.as_str() {
+                "varmlen" => None,
+                "happ" | "incy" => Some(value),
+                other => bail!("unknown client {other:?}; expected varmlen, happ or incy"),
+            };
+        }
     }
     println!(
-        "mode={} killswitch={} allow-lan={}",
-        config.settings.mode, config.settings.killswitch, config.settings.allow_lan
+        "mode={} killswitch={} allow-lan={} mtu={} user-agent={}",
+        config.settings.mode,
+        config.settings.killswitch,
+        config.settings.allow_lan,
+        config.settings.mtu,
+        config.settings.user_agent.as_deref().unwrap_or("varmlen"),
     );
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Section {
+    Apps,
+    Sites,
+}
+
+/// Apply one edit and report which section it touched, so only that one is
+/// echoed back.
+fn split(config: &mut Config, command: SplitCommand) -> Result<Section> {
+    let (section, action, mode, list) = match command {
+        SplitCommand::Apps { action } => (
+            Section::Apps,
+            action,
+            &mut config.split.apps_mode,
+            &mut config.split.apps,
+        ),
+        SplitCommand::Sites { action } => (
+            Section::Sites,
+            action,
+            &mut config.split.sites_mode,
+            &mut config.split.sites,
+        ),
+    };
+    let Some(action) = action else {
+        return Ok(section);
+    };
+    match action {
+        ListCommand::Mode { value } => {
+            if value != "selective" && value != "general" {
+                bail!("expected \"selective\" or \"general\", got {value:?}");
+            }
+            *mode = value;
+        }
+        ListCommand::Add { values } => {
+            for value in values {
+                let value = value.trim().to_string();
+                if value.is_empty() || list.contains(&value) {
+                    continue;
+                }
+                list.push(value);
+            }
+        }
+        ListCommand::Remove { values } => {
+            let before = list.len();
+            list.retain(|entry| !values.iter().any(|value| value.trim() == entry));
+            if list.len() == before {
+                bail!("nothing matched");
+            }
+        }
+        ListCommand::Clear => list.clear(),
+    }
+    Ok(section)
+}
+
+/// Spell out which way each list points: "selective" and "general" invert the
+/// meaning of the entries under them, and getting that backwards is the
+/// difference between tunnelling one app and tunnelling everything but it.
+fn print_split(split: &SplitInput, only: Option<Section>) {
+    for (section, caption, mode, entries, selective) in [
+        (
+            Section::Apps,
+            "Apps",
+            &split.apps_mode,
+            &split.apps,
+            split.apps_selective(),
+        ),
+        (
+            Section::Sites,
+            "Sites",
+            &split.sites_mode,
+            &split.sites,
+            split.sites_selective(),
+        ),
+    ] {
+        if only.is_some_and(|wanted| wanted != section) {
+            continue;
+        }
+        let mode = if mode.is_empty() { "general" } else { mode };
+        println!("{} {}", bold(caption), dim(&format!("({mode})")));
+        println!(
+            "{}",
+            dim(&format!(
+                "  {}",
+                if selective {
+                    "only these go through the tunnel"
+                } else {
+                    "everything goes through the tunnel except these"
+                }
+            ))
+        );
+        if entries.is_empty() {
+            println!("{}", dim("  (empty)"));
+        } else {
+            for entry in entries {
+                println!("  {entry}");
+            }
+        }
+    }
 }
 
 /// Refresh locations that came back with the same identity, add the rest.

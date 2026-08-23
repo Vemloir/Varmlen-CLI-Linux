@@ -92,6 +92,12 @@ pub struct Settings {
     pub mode: String,
     pub killswitch: bool,
     pub allow_lan: bool,
+    /// Tunnel MTU. See `varmlen_core::xray::TUN_MTU`.
+    pub mtu: u32,
+    /// Which client to present as when fetching subscriptions. Panels serve
+    /// different payloads per client, so this selects what the provider sends.
+    /// `None` means Varmlen's own.
+    pub user_agent: Option<String>,
 }
 
 impl Default for Settings {
@@ -100,6 +106,8 @@ impl Default for Settings {
             mode: "tun".to_string(),
             killswitch: false,
             allow_lan: true,
+            mtu: varmlen_core::xray::TUN_MTU,
+            user_agent: None,
         }
     }
 }

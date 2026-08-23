@@ -63,7 +63,28 @@ Settings:
 varmlen-cli set mode tun          # or: proxy
 varmlen-cli set killswitch on
 varmlen-cli set allow-lan off
+varmlen-cli set mtu 1420          # 1280-1500
+varmlen-cli set user-agent happ   # varmlen | happ | incy
 ```
+
+`user-agent` selects which client to present as when fetching a subscription.
+Panels serve different payloads per client, so this changes what the provider
+sends back, not how the tunnel itself looks on the wire.
+
+Split tunnelling:
+
+```sh
+varmlen-cli split                              # show both lists
+varmlen-cli split apps mode selective          # or: general
+varmlen-cli split apps add firefox chromium
+varmlen-cli split sites add "*.example.com"
+varmlen-cli split sites remove example.com
+varmlen-cli split apps clear
+```
+
+`selective` tunnels only what is listed; `general` tunnels everything except
+what is listed. The two lists carry independent modes, and `split` prints which
+way each one currently points.
 
 Configuration lives in `~/.config/varmlen/cli.json` (`varmlen-cli config-path`).
 It holds proxy credentials, so it is written `0600` in a `0700` directory.
