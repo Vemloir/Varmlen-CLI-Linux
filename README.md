@@ -86,6 +86,25 @@ varmlen-cli split apps clear
 what is listed. The two lists carry independent modes, and `split` prints which
 way each one currently points.
 
+A site is either an exact host (`example.com`) or a suffix covering its
+subdomains (`*.example.com`). Since `*` is a glob the shell expands first, the
+suffix form is also accepted as `.example.com`, which needs no quoting.
+
+Latency:
+
+```sh
+varmlen-cli ping                  # the last location connected to
+varmlen-cli ping Finland          # by name
+varmlen-cli ping --all            # every location
+varmlen-cli ping --all --tcp      # TCP handshake only: much faster, less telling
+```
+
+The default probe goes through the proxy — the daemon starts a throwaway xray
+on ports it reserves itself and times a real request, so the figure includes the
+TLS handshake and the proxy's own latency. `--tcp` times only the handshake to
+the endpoint, which says whether the host answers but nothing about the tunnel.
+Neither touches the current connection.
+
 Configuration lives in `~/.config/varmlen/cli.json` (`varmlen-cli config-path`).
 It holds proxy credentials, so it is written `0600` in a `0700` directory.
 

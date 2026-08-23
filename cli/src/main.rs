@@ -22,9 +22,12 @@ use varmlen_core::label::transport_summary;
 use varmlen_core::split::SplitInput;
 use varmlen_core::subscription::{parse_proxy_uri, VlessServer};
 use varmlen_core::xray::{
-    build_connection_probe_config, generate_xray_config, TUN_MTU_MAX, TUN_MTU_MIN,
+    build_connection_probe_config, build_ping_config, generate_xray_config,
+    ping_placeholder_ports, TUN_MTU_MAX, TUN_MTU_MIN,
 };
-use varmlend::protocol::{ConnectRequest, ConnectionMode, DaemonCommand, DaemonState};
+use varmlend::protocol::{
+    ConnectRequest, ConnectionMode, DaemonCommand, DaemonState, ProxyPingRequest, TcpPingRequest,
+};
 
 use config::{location_key, Config, Location, Subscription};
 use display::{bold, bytes, date, dim};
@@ -69,6 +72,8 @@ enum Command {
     /// Change connection settings.
     #[command(subcommand)]
     Set(SetCommand),
+    /// Measure latency to a location.
+    Ping(PingArgs),
     /// Choose which apps and sites go through the tunnel.
     Split {
         #[command(subcommand)]
@@ -97,6 +102,23 @@ enum SubCommand {
     Update,
     /// Remove a subscription (its locations are kept).
     Remove { url: String },
+}
+
+#[derive(Args)]
+struct PingArgs {
+    /// Probe every configured location instead of just one.
+    #[arg(long)]
+    all: bool,
+    /// Measure a plain TCP handshake to the endpoint instead of probing
+    /// through the proxy. Faster, but says nothing about the proxy itself.
+    #[arg(long)]
+    tcp: bool,
+    /// Timeout per probe, in milliseconds.
+    #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u32).range(100..=10_000))]
+    timeout: u32,
+    /// Location to probe; defaults to the last one connected to.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    name: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -205,6 +227,7 @@ async fn run() -> Result<()> {
             settings(&mut config, command)?;
             config.save()?;
         }
+        Command::Ping(args) => ping(&config, args).await?,
         Command::Split { action } => {
             let section = match action {
                 Some(action) => {
@@ -389,6 +412,22 @@ fn settings(config: &mut Config, command: SetCommand) -> Result<()> {
     Ok(())
 }
 
+/// Accept `.example.com` as a spelling of `*.example.com`.
+///
+/// The wildcard form is what the config stores and what rule generation
+/// expects, but `*` is a glob character: typing it unquoted makes the shell
+/// try to match files and fail before the CLI ever runs. The leading-dot form
+/// means the same thing and survives the shell.
+fn normalise_entry(section: Section, value: &str) -> String {
+    match section {
+        Section::Sites => match value.strip_prefix('.') {
+            Some(suffix) if !suffix.is_empty() => format!("*.{suffix}"),
+            _ => value.to_string(),
+        },
+        Section::Apps => value.to_string(),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Section {
     Apps,
@@ -397,6 +436,83 @@ enum Section {
 
 /// Apply one edit and report which section it touched, so only that one is
 /// echoed back.
+/// Probe one or more locations.
+///
+/// A probe that fails is reported against its location and the run continues:
+/// with `--all` the interesting result is usually which locations answer at
+/// all, and aborting on the first dead one would hide that.
+async fn ping(config: &Config, args: PingArgs) -> Result<()> {
+    let indices: Vec<usize> = if args.all {
+        (0..config.locations.len()).collect()
+    } else {
+        let name = args.name.join(" ");
+        let name = name.trim();
+        vec![if name.is_empty() {
+            config.active_index().map_err(anyhow::Error::msg)?
+        } else {
+            config.find(name).map_err(anyhow::Error::msg)?
+        }]
+    };
+    if indices.is_empty() {
+        bail!("no locations configured");
+    }
+
+    let width = indices
+        .iter()
+        .map(|index| config.locations[*index].server.label.chars().count())
+        .max()
+        .unwrap_or(0);
+
+    for index in indices {
+        let server = &config.locations[index].server;
+        print!("{:<width$}  ", server.label, width = width);
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+
+        match probe(server, &args).await {
+            Ok(rtt) => println!("{rtt} ms"),
+            Err(error) => println!("{}", dim(&compact(&error))),
+        }
+    }
+    Ok(())
+}
+
+/// The daemon wraps a probe failure in several layers of context
+/// ("daemon operation: PingFailed: TCP ping failed: connect: timed out"); in a
+/// column of results only the innermost cause carries information.
+fn compact(error: &anyhow::Error) -> String {
+    let text = format!("{error:#}");
+    text.rsplit(": ").next().unwrap_or(&text).to_string()
+}
+
+async fn probe(server: &VlessServer, args: &PingArgs) -> Result<u32> {
+    let command = if args.tcp {
+        DaemonCommand::TcpPing(TcpPingRequest {
+            host: server.host.clone(),
+            port: server.port,
+            timeout_ms: args.timeout,
+        })
+    } else {
+        // The daemon reserves real loopback ports and rewrites the template,
+        // so these are placeholders that only have to be distinct.
+        let ports = ping_placeholder_ports(server).map_err(|error| anyhow::anyhow!("{error}"))?;
+        let config = build_ping_config(server, &ports).map_err(|error| anyhow::anyhow!("{error}"))?;
+        DaemonCommand::ProxyPing(ProxyPingRequest {
+            xray_config: serde_json::to_string(&config)?,
+            socks_port: ports[0],
+            socks_ports: ports,
+            dns_probe_urls: Vec::new(),
+            timeout_ms: args.timeout,
+        })
+    };
+    // A fresh connection per probe: a daemon-side failure must not leave the
+    // rest of an --all run talking over a connection in an unknown state.
+    let state = daemon().await?.request(command).await?;
+    state
+        .rtt_ms
+        .ok_or_else(|| anyhow::anyhow!("daemon returned no round-trip time"))
+}
+
 fn split(config: &mut Config, command: SplitCommand) -> Result<Section> {
     let (section, action, mode, list) = match command {
         SplitCommand::Apps { action } => (
@@ -424,7 +540,7 @@ fn split(config: &mut Config, command: SplitCommand) -> Result<Section> {
         }
         ListCommand::Add { values } => {
             for value in values {
-                let value = value.trim().to_string();
+                let value = normalise_entry(section, value.trim());
                 if value.is_empty() || list.contains(&value) {
                     continue;
                 }
@@ -433,7 +549,11 @@ fn split(config: &mut Config, command: SplitCommand) -> Result<Section> {
         }
         ListCommand::Remove { values } => {
             let before = list.len();
-            list.retain(|entry| !values.iter().any(|value| value.trim() == entry));
+            let wanted: Vec<String> = values
+                .iter()
+                .map(|value| normalise_entry(section, value.trim()))
+                .collect();
+            list.retain(|entry| !wanted.contains(entry));
             if list.len() == before {
                 bail!("nothing matched");
             }

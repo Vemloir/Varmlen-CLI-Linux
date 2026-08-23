@@ -27,6 +27,17 @@ pub struct LocationKey {
     pub port: u16,
 }
 
+/// A label reduced to what a person would type.
+///
+/// Providers prefix labels with a flag emoji, so anchoring a prefix search at
+/// the true start of the string means it never matches anything the user would
+/// think to type.
+fn searchable(label: &str) -> String {
+    label
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
+}
+
 pub fn location_key(server: &VlessServer) -> LocationKey {
     LocationKey {
         label: server.label.clone(),
@@ -228,12 +239,18 @@ impl Config {
         }
         let lowered = needle.to_lowercase();
         let prefixed: Vec<usize> = self
-            .positions(|location| location.server.label.to_lowercase().starts_with(&lowered))
+            .positions(|location| searchable(&location.server.label).starts_with(&lowered))
             .collect();
-        if prefixed.is_empty() {
+        if !prefixed.is_empty() {
+            return self.single(prefixed, needle);
+        }
+        let contained: Vec<usize> = self
+            .positions(|location| location.server.label.to_lowercase().contains(&lowered))
+            .collect();
+        if contained.is_empty() {
             return Err(format!("no location matches {needle:?}"));
         }
-        self.single(prefixed, needle)
+        self.single(contained, needle)
     }
 
     fn positions<'a>(
@@ -337,6 +354,21 @@ mod tests {
         config.migrate();
         assert!(config.is_active(&config.locations[0].server));
         assert_eq!(config.active_index(), Ok(0));
+    }
+
+    #[test]
+    fn a_flag_emoji_does_not_hide_the_name() {
+        let config = with_locations(
+            vec![
+                server("\u{1F1EB}\u{1F1EE} Finland | Helsinki", "fi.example", 443),
+                server("\u{1F1E9}\u{1F1EA} Germany | Limburg", "de.example", 443),
+            ],
+            None,
+        );
+        assert_eq!(config.find("Finland"), Ok(0));
+        assert_eq!(config.find("germany"), Ok(1));
+        // Substring still reaches the part after the separator.
+        assert_eq!(config.find("Helsinki"), Ok(0));
     }
 
     #[test]
