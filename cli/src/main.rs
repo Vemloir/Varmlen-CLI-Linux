@@ -9,6 +9,8 @@
 //! under systemd instead (see `packaging/varmlend.service`).
 
 mod config;
+mod display;
+
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -16,11 +18,13 @@ use clap::{Args, Parser, Subcommand};
 use varmlen_core::daemon_client::DaemonClient;
 use varmlen_core::endpoint::resolve_server_ips;
 use varmlen_core::fetch::fetch_subscription;
+use varmlen_core::label::transport_summary;
 use varmlen_core::subscription::{parse_proxy_uri, VlessServer};
 use varmlen_core::xray::{build_connection_probe_config, generate_xray_config};
 use varmlend::protocol::{ConnectRequest, ConnectionMode, DaemonCommand, DaemonState};
 
-use config::{Config, Subscription};
+use config::{location_key, Config, Location, Subscription};
+use display::{bold, bytes, date, dim};
 
 #[derive(Parser)]
 #[command(
@@ -113,26 +117,28 @@ async fn run() -> Result<()> {
         }
         Command::List => list(&config),
         Command::Use { name } => {
-            let label = config.find(&name).map_err(anyhow::Error::msg)?.label.clone();
-            config.active = Some(label.clone());
+            let index = config.find(&name).map_err(anyhow::Error::msg)?;
+            let server = config.locations[index].server.clone();
+            let label = server.label.clone();
+            config.set_active(&server);
             config.save()?;
             println!("active location: {label}");
         }
         Command::Add { uri } => {
             let server = parse_proxy_uri(&uri).map_err(|error| anyhow::anyhow!("{error}"))?;
             let label = server.label.clone();
-            merge(&mut config, vec![server]);
+            merge(&mut config, vec![server], None);
             config.save()?;
             println!("added {label}");
         }
         Command::Remove { name } => {
-            let label = config.find(&name).map_err(anyhow::Error::msg)?.label.clone();
-            config.servers.retain(|server| server.label != label);
-            if config.active.as_deref() == Some(label.as_str()) {
+            let index = config.find(&name).map_err(anyhow::Error::msg)?;
+            let removed = config.locations.remove(index);
+            if config.is_active(&removed.server) {
                 config.active = None;
             }
             config.save()?;
-            println!("removed {label}");
+            println!("removed {}", removed.server.label);
         }
         Command::Sub(command) => subscriptions(&mut config, command).await?,
         Command::Log { clear } => {
@@ -168,10 +174,11 @@ async fn daemon() -> Result<DaemonClient> {
 }
 
 async fn connect(config: &Config, name: Option<&str>) -> Result<()> {
-    let server: &VlessServer = match name {
+    let index = match name {
         Some(name) => config.find(name).map_err(anyhow::Error::msg)?,
-        None => config.active_server().map_err(anyhow::Error::msg)?,
+        None => config.active_index().map_err(anyhow::Error::msg)?,
     };
+    let server: &VlessServer = &config.locations[index].server;
 
     let mode = match config.settings.mode.as_str() {
         "tun" => ConnectionMode::Tun,
@@ -225,18 +232,19 @@ async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
                 .await
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
             let count = result.servers.len();
-            let title = result.meta.title.clone();
-            merge(config, result.servers);
-            config.subscriptions.push(Subscription { url, title });
+            merge(config, result.servers, Some(&url));
+            config.subscriptions.push(Subscription {
+                url,
+                meta: result.meta,
+                description: result.description,
+            });
             config.save()?;
             println!("imported {count} location(s)");
         }
         SubCommand::List => {
             for sub in &config.subscriptions {
-                match &sub.title {
-                    Some(title) => println!("{title}  {}", sub.url),
-                    None => println!("{}", sub.url),
-                }
+                println!("{}", bold(&sub.display_name()));
+                println!("{}", dim(&format!("  {}", sub.url)));
             }
         }
         SubCommand::Update => {
@@ -249,9 +257,10 @@ async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
                     .await
                     .map_err(|error| anyhow::anyhow!("updating {url}: {error}"))?;
                 let count = result.servers.len();
-                merge(config, result.servers);
+                merge(config, result.servers, Some(&url));
                 if let Some(sub) = config.subscriptions.iter_mut().find(|s| s.url == url) {
-                    sub.title = result.meta.title.clone();
+                    sub.meta = result.meta;
+                    sub.description = result.description;
                 }
                 println!("{url}: {count} location(s)");
             }
@@ -295,36 +304,144 @@ fn settings(config: &mut Config, command: SetCommand) -> Result<()> {
     Ok(())
 }
 
-/// Replace locations that came back with the same identity, keep the rest.
-fn merge(config: &mut Config, incoming: Vec<VlessServer>) {
+/// Refresh locations that came back with the same identity, add the rest.
+///
+/// Keyed on `location_key` rather than the display name: providers reuse names
+/// across locations, and matching on one would collapse distinct servers into
+/// a single entry.
+fn merge(config: &mut Config, incoming: Vec<VlessServer>, source: Option<&str>) {
     for server in incoming {
+        let key = location_key(&server);
         match config
-            .servers
+            .locations
             .iter_mut()
-            .find(|existing| existing.label == server.label)
+            .find(|existing| location_key(&existing.server) == key)
         {
-            Some(existing) => *existing = server,
-            None => config.servers.push(server),
+            Some(existing) => {
+                existing.server = server;
+                existing.source = source.map(str::to_string);
+            }
+            None => config.locations.push(Location {
+                server,
+                source: source.map(str::to_string),
+            }),
         }
     }
 }
 
 fn list(config: &Config) {
-    if config.servers.is_empty() {
+    if config.locations.is_empty() {
         println!("no locations configured");
         return;
     }
-    for server in &config.servers {
-        let marker = if config.active.as_deref() == Some(server.label.as_str()) {
-            "*"
-        } else {
-            " "
-        };
-        println!(
-            "{marker} {:<32} {}://{}:{}",
-            server.label, server.protocol, server.host, server.port
-        );
+
+    // Providers reuse display names, so a name alone can be ambiguous. Only
+    // then is the endpoint worth the extra noise on the line.
+    let duplicated: Vec<&str> = config
+        .locations
+        .iter()
+        .filter(|location| {
+            config
+                .locations
+                .iter()
+                .filter(|other| other.server.label == location.server.label)
+                .count()
+                > 1
+        })
+        .map(|location| location.server.label.as_str())
+        .collect();
+
+    let mut first = true;
+    for subscription in &config.subscriptions {
+        let members: Vec<usize> = config
+            .locations
+            .iter()
+            .enumerate()
+            .filter(|(_, location)| location.source.as_deref() == Some(subscription.url.as_str()))
+            .map(|(index, _)| index)
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        if !std::mem::take(&mut first) {
+            println!();
+        }
+        print_subscription(subscription);
+        for index in members {
+            print_location(config, index, &duplicated);
+        }
     }
+
+    let manual: Vec<usize> = config
+        .locations
+        .iter()
+        .enumerate()
+        .filter(|(_, location)| location.source.is_none())
+        .map(|(index, _)| index)
+        .collect();
+    if !manual.is_empty() {
+        if !std::mem::take(&mut first) {
+            println!();
+        }
+        println!("{}", bold("Added manually"));
+        for index in manual {
+            print_location(config, index, &duplicated);
+        }
+    }
+}
+
+/// Subscription header: name, then whatever metadata the provider actually
+/// sent. Nothing is invented — absent fields simply do not appear.
+fn print_subscription(subscription: &Subscription) {
+    println!("{}", bold(&subscription.display_name()));
+
+    if let Some(description) = subscription
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        for line in description.lines() {
+            println!("{}", dim(&format!("  {line}")));
+        }
+    }
+
+    let meta = &subscription.meta;
+    let used = meta.upload_bytes.unwrap_or(0) + meta.download_bytes.unwrap_or(0);
+    let mut facts = Vec::new();
+    if meta.upload_bytes.is_some() || meta.download_bytes.is_some() {
+        facts.push(match meta.total_bytes {
+            Some(total) => format!("{} of {} used", bytes(used), bytes(total)),
+            None => format!("{} used", bytes(used)),
+        });
+    }
+    if let Some(expiry) = meta.expires_at_unix {
+        facts.push(format!("expires {}", date(expiry)));
+    }
+    if !facts.is_empty() {
+        println!("{}", dim(&format!("  {}", facts.join("  ·  "))));
+    }
+
+    for (caption, url) in [
+        ("support", meta.support_url.as_deref()),
+        ("info", meta.web_page_url.as_deref()),
+    ] {
+        if let Some(url) = url.map(str::trim).filter(|url| !url.is_empty()) {
+            println!("{}", dim(&format!("  {caption}: {url}")));
+        }
+    }
+}
+
+fn print_location(config: &Config, index: usize, duplicated: &[&str]) {
+    let server = &config.locations[index].server;
+    let marker = if config.is_active(server) { "*" } else { " " };
+    println!("{marker} {:>3}  {}", index + 1, server.label);
+
+    let mut summary = transport_summary(server);
+    if duplicated.contains(&server.label.as_str()) {
+        summary.push_str(&format!("  ·  {}:{}", server.host, server.port));
+    }
+    println!("{}", dim(&format!("       {summary}")));
 }
 
 fn print_state(state: &DaemonState) {

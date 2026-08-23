@@ -6,6 +6,7 @@
 
 pub mod daemon_client;
 pub mod endpoint;
+pub mod label;
 pub mod fetch;
 pub mod split;
 pub mod subscription;

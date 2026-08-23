@@ -141,7 +141,7 @@ impl VlessServer {
 }
 
 /// Server-side subscription metadata parsed from HTTP response headers.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubscriptionMeta {
     /// `Profile-Title` header — used as the subscription display name.
     pub title: Option<String>,
