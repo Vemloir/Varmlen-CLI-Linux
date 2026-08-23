@@ -30,7 +30,7 @@ use varmlend::protocol::{
 };
 
 use config::{location_key, Config, Location, Subscription};
-use display::{bold, bytes, date, dim};
+use display::{bold, bytes, date, dim, label};
 
 #[derive(Parser)]
 #[command(
@@ -167,6 +167,9 @@ enum SetCommand {
     /// Which client to present as when fetching subscriptions:
     /// varmlen, happ or incy. Panels serve different payloads per client.
     UserAgent { value: String },
+    /// Show emoji in location names. Turn off for terminals that cannot draw
+    /// them: flags become country codes rather than disappearing.
+    Emoji { value: String },
 }
 
 #[tokio::main]
@@ -197,7 +200,7 @@ async fn run() -> Result<()> {
             let label = server.label.clone();
             merge(&mut config, vec![server], None);
             config.save()?;
-            println!("added {label}");
+            println!("added {}", display::label(&label, config.settings.emoji));
         }
         Command::Remove { name } => {
             let index = config
@@ -207,8 +210,9 @@ async fn run() -> Result<()> {
             if config.is_active(&removed.server) {
                 config.active = None;
             }
+            let name = label(&removed.server.label, config.settings.emoji);
             config.save()?;
-            println!("removed {}", removed.server.label);
+            println!("removed {name}");
         }
         Command::Sub(command) => subscriptions(&mut config, command).await?,
         Command::Log { clear } => {
@@ -306,7 +310,10 @@ async fn connect(config: &mut Config, name: Option<&str>) -> Result<()> {
         killswitch: config.settings.killswitch,
         allow_lan: config.settings.allow_lan,
     };
-    println!("connecting to {}…", server.label);
+    println!(
+        "connecting to {}…",
+        label(&server.label, config.settings.emoji)
+    );
     print_state(&daemon().await?.request(DaemonCommand::Connect(request)).await?);
     Ok(())
 }
@@ -393,6 +400,7 @@ fn settings(config: &mut Config, command: SetCommand) -> Result<()> {
             }
             config.settings.mtu = value;
         }
+        SetCommand::Emoji { value } => config.settings.emoji = flag(&value)?,
         SetCommand::UserAgent { value } => {
             config.settings.user_agent = match value.as_str() {
                 "varmlen" => None,
@@ -402,12 +410,13 @@ fn settings(config: &mut Config, command: SetCommand) -> Result<()> {
         }
     }
     println!(
-        "mode={} killswitch={} allow-lan={} mtu={} user-agent={}",
+        "mode={} killswitch={} allow-lan={} mtu={} user-agent={} emoji={}",
         config.settings.mode,
         config.settings.killswitch,
         config.settings.allow_lan,
         config.settings.mtu,
         config.settings.user_agent.as_deref().unwrap_or("varmlen"),
+        config.settings.emoji,
     );
     Ok(())
 }
@@ -457,15 +466,20 @@ async fn ping(config: &Config, args: PingArgs) -> Result<()> {
         bail!("no locations configured");
     }
 
-    let width = indices
+    let names: Vec<String> = indices
         .iter()
-        .map(|index| config.locations[*index].server.label.chars().count())
-        .max()
-        .unwrap_or(0);
+        .map(|index| {
+            label(
+                &config.locations[*index].server.label,
+                config.settings.emoji,
+            )
+        })
+        .collect();
+    let width = names.iter().map(|name| name.chars().count()).max().unwrap_or(0);
 
-    for index in indices {
+    for (index, name) in indices.into_iter().zip(names) {
         let server = &config.locations[index].server;
-        print!("{:<width$}  ", server.label, width = width);
+        print!("{name:<width$}  ", width = width);
         use std::io::Write;
         let _ = std::io::stdout().flush();
 
@@ -740,7 +754,11 @@ fn print_subscription(subscription: &Subscription) {
 fn print_location(config: &Config, index: usize, duplicated: &[&str]) {
     let server = &config.locations[index].server;
     let marker = if config.is_active(server) { "*" } else { " " };
-    println!("{marker} {:>3}  {}", index + 1, server.label);
+    println!(
+        "{marker} {:>3}  {}",
+        index + 1,
+        label(&server.label, config.settings.emoji)
+    );
 
     let mut summary = transport_summary(server);
     if duplicated.contains(&server.label.as_str()) {
@@ -749,16 +767,22 @@ fn print_location(config: &Config, index: usize, duplicated: &[&str]) {
     println!("{}", dim(&format!("       {summary}")));
 }
 
+/// Phase on its own line, with whatever qualifies it underneath: the phase is
+/// the answer to "am I connected", and the rest is detail about how.
 fn print_state(state: &DaemonState) {
-    print!("{:?}", state.phase);
+    println!("{:?}", state.phase);
+
+    let mut details = Vec::new();
     if state.split_active {
-        print!("  split");
+        details.push("split tunnelling active".to_string());
     }
     if state.dns_protected {
-        print!("  dns-protected");
+        details.push("DNS protected".to_string());
     }
     if let Some(rtt) = state.rtt_ms {
-        print!("  {rtt}ms");
+        details.push(format!("{rtt} ms"));
     }
-    println!();
+    if !details.is_empty() {
+        println!("{}", dim(&format!("  {}", details.join("  ·  "))));
+    }
 }

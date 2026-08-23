@@ -95,3 +95,71 @@ mod tests {
         assert_eq!(bytes(150 * 1024 * 1024 * 1024), "150 GiB");
     }
 }
+
+/// Render a provider label for a terminal that cannot draw emoji.
+///
+/// VTE-based terminals (Ptyxis, GNOME Terminal) do not compose regional
+/// indicator pairs into flags no matter which fonts are installed, so a label
+/// like "\u{1F1EB}\u{1F1EE} Finland" arrives as blanks or boxes. A flag is not
+/// decoration though — it names the country — so the pair is turned back into
+/// its ISO letters rather than dropped, and only the genuinely decorative
+/// pictographs are removed.
+pub fn label(text: &str, emoji: bool) -> String {
+    if emoji {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        let cp = ch as u32;
+        match cp {
+            // Regional indicators A-Z: recover the country code.
+            0x1F1E6..=0x1F1FF => {
+                out.push((b'A' + (cp - 0x1F1E6) as u8) as char);
+            }
+            // Variation selectors and ZWJ: joiners with nothing left to join.
+            0x200D | 0xFE00..=0xFE0F => {}
+            // Pictographs, symbols, dingbats.
+            0x1F000..=0x1FAFF | 0x2600..=0x27BF | 0x2B00..=0x2BFF => {}
+            _ => out.push(ch),
+        }
+    }
+    // Removing a pictograph leaves the space that separated it behind.
+    let mut collapsed = String::with_capacity(out.len());
+    let mut previous_space = false;
+    for ch in out.trim().chars() {
+        let space = ch.is_whitespace();
+        if !(space && previous_space) {
+            collapsed.push(ch);
+        }
+        previous_space = space;
+    }
+    collapsed
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::label;
+
+    #[test]
+    fn flags_become_country_codes() {
+        assert_eq!(
+            label("\u{1F1EB}\u{1F1EE} Finland | Helsinki", false),
+            "FI Finland | Helsinki"
+        );
+        assert_eq!(
+            label("\u{1F1F7}\u{1F1FA} \u{0411}\u{0435}\u{043B}\u{044B}\u{0439} \u{1F4C4}", false),
+            "RU \u{0411}\u{0435}\u{043B}\u{044B}\u{0439}"
+        );
+    }
+
+    #[test]
+    fn enabling_emoji_leaves_the_label_alone() {
+        let original = "\u{1F1EB}\u{1F1EE} Finland";
+        assert_eq!(label(original, true), original);
+    }
+
+    #[test]
+    fn plain_labels_are_untouched() {
+        assert_eq!(label("Frankfurt 01", false), "Frankfurt 01");
+    }
+}

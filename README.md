@@ -65,7 +65,14 @@ varmlen-cli set killswitch on
 varmlen-cli set allow-lan off
 varmlen-cli set mtu 1420          # 1280-1500
 varmlen-cli set user-agent happ   # varmlen | happ | incy
+varmlen-cli set emoji off         # for terminals that cannot draw emoji
 ```
+
+`emoji off` is for VTE-based terminals (Ptyxis, GNOME Terminal), which do not
+compose regional indicator pairs into flags whatever fonts are installed. A flag
+names a country rather than decorating one, so it is turned back into its ISO
+letters — `FI Finland | Helsinki` — instead of being dropped; other pictographs
+are removed.
 
 `user-agent` selects which client to present as when fetching a subscription.
 Panels serve different payloads per client, so this changes what the provider

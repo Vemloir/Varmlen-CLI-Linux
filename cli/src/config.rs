@@ -109,6 +109,9 @@ pub struct Settings {
     /// different payloads per client, so this selects what the provider sends.
     /// `None` means Varmlen's own.
     pub user_agent: Option<String>,
+    /// Whether the terminal can draw emoji. VTE-based terminals cannot compose
+    /// flag sequences, so labels are shown with country codes instead.
+    pub emoji: bool,
 }
 
 impl Default for Settings {
@@ -119,6 +122,7 @@ impl Default for Settings {
             allow_lan: true,
             mtu: varmlen_core::xray::TUN_MTU,
             user_agent: None,
+            emoji: true,
         }
     }
 }
