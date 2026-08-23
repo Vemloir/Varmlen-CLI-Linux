@@ -47,12 +47,13 @@ enum Command {
     Disconnect,
     /// List configured locations.
     List,
-    /// Choose the location used by `connect` with no argument.
-    Use { name: String },
     /// Add a location from a vless:// / vmess:// / trojan:// / ss:// URI.
     Add { uri: String },
-    /// Remove a location by name.
-    Remove { name: String },
+    /// Remove a location by its number from `list`, or by name.
+    Remove {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        name: Vec<String>,
+    },
     /// Manage subscriptions.
     #[command(subcommand)]
     Sub(SubCommand),
@@ -71,8 +72,11 @@ enum Command {
 
 #[derive(Args)]
 struct ConnectArgs {
-    /// Location to connect to; defaults to the active one.
-    name: Option<String>,
+    /// Location to connect to: its number from `list`, or its name. Everything
+    /// after `connect` is taken as the name, so it needs no quoting. Omit it to
+    /// reuse the last location connected to.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    name: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -111,19 +115,15 @@ async fn run() -> Result<()> {
 
     match cli.command {
         Command::Status => print_state(&daemon().await?.request(DaemonCommand::Status).await?),
-        Command::Connect(args) => connect(&config, args.name.as_deref()).await?,
+        Command::Connect(args) => {
+            let name = args.name.join(" ");
+            let name = name.trim();
+            connect(&mut config, (!name.is_empty()).then_some(name)).await?
+        }
         Command::Disconnect => {
             print_state(&daemon().await?.request(DaemonCommand::Disconnect).await?)
         }
         Command::List => list(&config),
-        Command::Use { name } => {
-            let index = config.find(&name).map_err(anyhow::Error::msg)?;
-            let server = config.locations[index].server.clone();
-            let label = server.label.clone();
-            config.set_active(&server);
-            config.save()?;
-            println!("active location: {label}");
-        }
         Command::Add { uri } => {
             let server = parse_proxy_uri(&uri).map_err(|error| anyhow::anyhow!("{error}"))?;
             let label = server.label.clone();
@@ -132,7 +132,9 @@ async fn run() -> Result<()> {
             println!("added {label}");
         }
         Command::Remove { name } => {
-            let index = config.find(&name).map_err(anyhow::Error::msg)?;
+            let index = config
+                .find(name.join(" ").trim())
+                .map_err(anyhow::Error::msg)?;
             let removed = config.locations.remove(index);
             if config.is_active(&removed.server) {
                 config.active = None;
@@ -173,11 +175,17 @@ async fn daemon() -> Result<DaemonClient> {
     })
 }
 
-async fn connect(config: &Config, name: Option<&str>) -> Result<()> {
+async fn connect(config: &mut Config, name: Option<&str>) -> Result<()> {
     let index = match name {
         Some(name) => config.find(name).map_err(anyhow::Error::msg)?,
         None => config.active_index().map_err(anyhow::Error::msg)?,
     };
+    // Naming a location is also choosing it: a later bare `connect` reuses it.
+    if name.is_some() {
+        let chosen = config.locations[index].server.clone();
+        config.set_active(&chosen);
+        config.save()?;
+    }
     let server: &VlessServer = &config.locations[index].server;
 
     let mode = match config.settings.mode.as_str() {

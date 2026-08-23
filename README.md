@@ -46,11 +46,16 @@ sudo systemctl enable --now varmlend@$(id -u)
 ```sh
 varmlen-cli sub add https://example.com/subscription   # or: varmlen-cli add vless://…
 varmlen-cli list
-varmlen-cli use "Netherlands 01"
-varmlen-cli connect
+varmlen-cli connect 2                 # by number from `list`
+varmlen-cli connect Finland           # or by name — a prefix is enough
+varmlen-cli connect                   # reuses the last location connected to
 varmlen-cli status
 varmlen-cli disconnect
 ```
+
+Everything after `connect` is taken as the location name, so names with spaces
+need no quoting. Where a provider ships several locations under one name, `list`
+numbers them and reports the endpoints to choose between.
 
 Settings:
 

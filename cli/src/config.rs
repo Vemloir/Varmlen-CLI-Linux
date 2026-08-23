@@ -275,15 +275,15 @@ impl Config {
                 .iter()
                 .position(|location| location_key(&location.server) == *key)
                 .ok_or_else(|| {
-                    "the active location is gone; pick another with `varmlen-cli use <name>`".into()
+                    "the last location connected to is gone; name one: `varmlen-cli connect <name>`".into()
                 }),
             Some(ActiveRef::Legacy(_)) => {
-                Err("the active location is gone; pick another with `varmlen-cli use <name>`".into())
+                Err("the last location connected to is gone; name one: `varmlen-cli connect <name>`".into())
             }
             None => match self.locations.len() {
                 1 => Ok(0),
                 0 => Err("no locations configured; add one with `varmlen-cli add <uri>`".into()),
-                _ => Err("no active location; pick one with `varmlen-cli use <name>`".into()),
+                _ => Err("no location chosen yet; name one: `varmlen-cli connect <name>`".into()),
             },
         }
     }
