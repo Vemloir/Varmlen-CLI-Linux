@@ -1,0 +1,29 @@
+# Instance name is the uid of the desktop user the daemon serves, e.g.
+#   sudo systemctl enable --now varmlen-cli@1000
+#
+# The daemon is not sandboxed here on purpose: it installs routes, routing
+# rules, nftables chains and BPF programs, and it manages cgroups for per-app
+# split tunnelling. The usual hardening knobs (NoNewPrivileges, RestrictAddress
+# Families, ProtectKernelTunables, private namespaces) each break one of those.
+
+[Unit]
+Description=Varmlen networking daemon, CLI installation (owner uid %i)
+Documentation=https://github.com/Vemloir/Varmlen-CLI-Linux
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=/opt/varmlen-cli/varmlend --owner-uid %i
+
+# On SIGTERM the daemon disconnects first, so the tunnel's kernel state is
+# removed before it exits. Killing it any harder leaves the machine with the
+# tunnel's routes still installed and no working default route.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
