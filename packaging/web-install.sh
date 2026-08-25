@@ -5,12 +5,14 @@
 #   curl -fsSL https://aegisvpn.org/varmlen-cli-linux/install.sh | sh
 #
 # Downloads the release tarball from GitHub, verifies its SHA-256 against the
-# checksums published with the same release, and installs:
+# checksums published with the same release, and installs without privileges:
 #
-#   /usr/bin/varmlen-cli
-#   /usr/libexec/varmlen/varmlend
-#   /usr/libexec/varmlen/varmlen-net
-#   /etc/systemd/system/varmlend@.service
+#   ~/.local/bin/varmlen-cli
+#   ~/.local/share/varmlen/stage/{varmlend,varmlen-net,xray,varmlen-cli@.service}
+#
+# The daemon has to run as root, so those staged files are moved into
+# /opt/varmlen-cli the first time a command needs it — varmlen-cli asks for
+# sudo at that point, and not before.
 #
 # Environment:
 #   VARMLEN_VERSION   install a specific tag (default: the latest release)
@@ -69,21 +71,17 @@ echo "Checksum verified."
 
 tar -C "$TMP" -xzf "$TMP/$NAME.tar.gz"
 
-if [ "$(id -u)" -eq 0 ]; then
-    sh "$TMP/$NAME/install.sh"
-else
-    command -v sudo >/dev/null 2>&1 || die "run as root, or install sudo"
-    echo "Installing (sudo required)…"
-    sudo sh "$TMP/$NAME/install.sh"
-fi
+sh "$TMP/$NAME/install.sh"
 
 cat <<'NEXT'
 
 Next:
-  sudo systemctl enable --now varmlend@$(id -u)
   varmlen-cli sub add <your subscription URL>
   varmlen-cli list
   varmlen-cli connect
+
+The first command that needs the daemon installs it, which asks for sudo once:
+the daemon manages routes and firewall rules, so it cannot run unprivileged.
 
 The desktop client, if you also use it, starts its own daemon and only one may
 own the network at a time — run one or the other.

@@ -200,7 +200,8 @@ impl CleanupBackend for SystemCleanupBackend {
             }
             Resource::RouteTable(table) if matches!(table.as_str(), "100" | "101") => {
                 if table == "100" {
-                    let _ = command_success("/usr/libexec/varmlen/varmlen-net", &["cleanup"]).await;
+                    let helper = crate::system::installed_net_helper();
+                    let _ = command_success(&helper.to_string_lossy(), &["cleanup"]).await;
                 }
                 let marks: &[&str] = if table == "100" {
                     &["0x2024", "0x2025"]

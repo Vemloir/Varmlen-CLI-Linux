@@ -26,8 +26,30 @@ use crate::recovery::ProcessIdentity;
 use crate::split::system::SystemSplitBackend;
 use crate::split::{SplitBackend, SplitManager, SplitPlan};
 
-pub const INSTALLED_XRAY: &str = "/usr/libexec/varmlen/xray";
-pub const INSTALLED_NET_HELPER: &str = "/usr/libexec/varmlen/varmlen-net";
+/// Where the components live when nothing better can be determined.
+const DEFAULT_COMPONENT_DIR: &str = "/usr/libexec/varmlen";
+
+/// The directory this daemon was started from.
+///
+/// Components are resolved next to the running binary rather than at a fixed
+/// path so that two installations can coexist — a distribution package in
+/// /usr/libexec/varmlen and a self-installed copy elsewhere — without either
+/// executing the other's helper or core, or overwriting its files.
+fn component_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .filter(|dir| dir.join("varmlen-net").is_file())
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_COMPONENT_DIR))
+}
+
+pub fn installed_xray() -> PathBuf {
+    component_dir().join("xray")
+}
+
+pub fn installed_net_helper() -> PathBuf {
+    component_dir().join("varmlen-net")
+}
 const TUN_INTERFACE: &str = "varmlen0";
 const PROXY_PORT: u16 = 2081;
 const XRAY_DIAL_MARK: u64 = 0x2024;
@@ -217,7 +239,8 @@ where
 }
 
 pub async fn run_tcp_ping(request: &TcpPingRequest) -> Result<u32, DaemonError> {
-    let helper = Path::new(INSTALLED_NET_HELPER);
+    let helper = installed_net_helper();
+    let helper = helper.as_path();
     ensure_trusted_binary(helper)?;
     let output = timeout(
         Duration::from_millis(request.timeout_ms as u64 + 500),
@@ -264,7 +287,8 @@ pub async fn run_proxy_ping(
     owner_uid: u32,
     request: &ProxyPingRequest,
 ) -> Result<u32, DaemonError> {
-    let xray = Path::new(INSTALLED_XRAY);
+    let xray = installed_xray();
+    let xray = xray.as_path();
     ensure_trusted_binary(xray)?;
     let template_ports = request.effective_socks_ports();
     let dns_probe_urls = request.effective_dns_probe_urls();
@@ -442,8 +466,8 @@ impl SystemLifecycleBackend {
     pub fn installed(owner_uid: u32) -> Self {
         Self::new(
             owner_uid,
-            PathBuf::from(INSTALLED_XRAY),
-            PathBuf::from(INSTALLED_NET_HELPER),
+            installed_xray(),
+            installed_net_helper(),
             PathBuf::from(format!("/run/varmlen/user-{owner_uid}")),
         )
     }

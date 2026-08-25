@@ -10,6 +10,7 @@
 
 mod config;
 mod display;
+mod setup;
 
 
 use std::sync::Arc;
@@ -87,6 +88,15 @@ enum Command {
     },
     /// Print the path of the CLI's config file.
     ConfigPath,
+    /// Install the daemon. Invoked by the CLI itself through sudo when a
+    /// command first needs the daemon; not meant to be run by hand.
+    #[command(name = "__install-daemon", hide = true)]
+    InstallDaemon {
+        #[arg(long)]
+        stage: std::path::PathBuf,
+        #[arg(long)]
+        owner_uid: u32,
+    },
 }
 
 #[derive(Args)]
@@ -299,19 +309,30 @@ async fn run() -> Result<()> {
             print_split(&config.split, section);
         }
         Command::ConfigPath => println!("{}", config::config_path().display()),
+        Command::InstallDaemon { stage, owner_uid } => setup::install_as_root(&stage, owner_uid)?,
     }
     Ok(())
 }
 
-/// Connect to the running daemon, translating "no socket" into the actionable
-/// cause rather than a bare ENOENT.
+/// Connect to the daemon, installing and starting it if this is the first time.
+///
+/// Installation is deferred to here rather than done by the installer so that
+/// getting the client needs no privileges at all; root is asked for at the
+/// first moment it is actually required, and only then.
 async fn daemon() -> Result<DaemonClient> {
-    DaemonClient::connect_installed().await.map_err(|error| {
-        anyhow::anyhow!(
-            "{error}\n\nThe varmlend daemon does not appear to be running. Start it with:\n  \
-             sudo systemctl start varmlend"
-        )
+    if let Ok(client) = DaemonClient::connect_installed().await {
+        return Ok(client);
+    }
+
+    let socket = DaemonClient::installed_socket_path();
+    tokio::task::spawn_blocking(move || {
+        setup::elevate_and_install(|| std::os::unix::net::UnixStream::connect(&socket).is_ok())
     })
+    .await??;
+
+    DaemonClient::connect_installed()
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
 async fn connect(config: &mut Config, name: Option<&str>) -> Result<()> {

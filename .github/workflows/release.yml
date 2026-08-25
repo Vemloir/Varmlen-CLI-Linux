@@ -15,23 +15,29 @@ jobs:
         include:
           - runner: ubuntu-latest
             arch: x86_64
+            target: x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
             arch: aarch64
+            target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
       # Also asserts the binaries carry no build-machine paths.
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: ./scripts/build-release.sh
+      - run: ./scripts/fetch-xray.sh target/${{ matrix.target }}/release ${{ matrix.arch }}
 
       - name: Package
         run: |
           set -eu
           name=varmlen-cli-linux-${{ matrix.arch }}
           mkdir -p "dist/$name"
-          cp target/release/varmlen-cli target/release/varmlend target/release/varmlen-net "dist/$name/"
-          cp packaging/varmlend@.service packaging/install.sh "dist/$name/"
+          out=target/${{ matrix.target }}/release
+          cp "$out/varmlen-cli" "$out/varmlend" "$out/varmlen-net" "dist/$name/"
+          cp "$out/xray" "$out/LICENSE.xray" "dist/$name/"
+          cp packaging/varmlen-cli@.service packaging/install.sh "dist/$name/"
           cp README.md LICENSE "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           ( cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256" )

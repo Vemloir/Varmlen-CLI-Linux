@@ -122,8 +122,10 @@ fn verify_cgroup2(directory: &File) -> Result<(), SplitError> {
         return Err(SplitError::CgroupUnavailable);
     }
     let stats = unsafe { stats.assume_init() };
-    const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
-    if stats.f_type != CGROUP2_SUPER_MAGIC {
+    // statfs::f_type is signed under glibc and unsigned under musl, so the
+    // comparison is made in one width rather than relying on the libc's choice.
+    const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
+    if stats.f_type as u64 != CGROUP2_SUPER_MAGIC {
         return Err(SplitError::CgroupUnavailable);
     }
     Ok(())
