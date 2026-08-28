@@ -125,6 +125,12 @@ A bare name resolves to a location before a subscription, since numbers and
 location names are what `list` shows; `ping sub <n>` says which was meant when
 both would match.
 
+A UDP transport pays a QUIC handshake before a probe answers, so Hysteria2,
+WireGuard, mKCP and QUIC locations get 15 s instead of the 5 s a TCP location
+needs — judging them on 5 s reports live nodes as dead. `--timeout` overrides
+that. `--tcp` falls back to the proxy probe on those locations rather than
+measuring a TCP listener that cannot exist.
+
 Probes run concurrently, so a sweep costs about as long as its slowest member
 rather than the sum of every timeout. Results print in `list` order, so the
 number beside one is the number to hand to `connect`.

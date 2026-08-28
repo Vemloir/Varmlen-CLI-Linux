@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration};
 
 use crate::protocol::{
-    decode_request_frame, encode_frame, DaemonCommand, DaemonError, DaemonErrorCode, DaemonState,
+    decode_request_frame, encode_frame, operation_id_of_rejected_request, DaemonCommand, DaemonError, DaemonErrorCode, DaemonState,
     ResponseEnvelope, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 
@@ -171,7 +171,7 @@ pub async fn serve_connection_with_limits(
             Err(code) => {
                 let response = ResponseEnvelope {
                     version: PROTOCOL_VERSION,
-                    operation_id: 0,
+                    operation_id: operation_id_of_rejected_request(&bytes),
                     result: Err(DaemonError {
                         code,
                         message: "invalid daemon request".to_string(),

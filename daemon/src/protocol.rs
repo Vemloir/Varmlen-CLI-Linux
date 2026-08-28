@@ -11,7 +11,13 @@ const MAX_PING_HOST_BYTES: usize = 253;
 const MAX_DNS_PROBE_URLS: usize = 8;
 const MAX_DNS_PROBE_URL_BYTES: usize = 2048;
 const MIN_PING_TIMEOUT_MS: u32 = 100;
-const MAX_PING_TIMEOUT_MS: u32 = 10_000;
+/// The longest probe a client may ask for.
+///
+/// A UDP-only location pays a QUIC handshake before the probe itself answers,
+/// and the clients give those locations 15 s for it. A ceiling below that budget
+/// made the request an `invalid request`, so every Hysteria2 location read as
+/// unpingable while its node was healthy.
+pub const MAX_PING_TIMEOUT_MS: u32 = 15_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -268,6 +274,22 @@ pub fn decode_request_frame(bytes: &[u8]) -> Result<RequestEnvelope, DaemonError
     Ok(request)
 }
 
+/// The operation id inside a frame the daemon refused to decode.
+///
+/// A refusal during decoding has no envelope to echo the id from, and clients
+/// then report an anonymous "operation ID mismatch" instead of the reason. When
+/// the envelope was readable and only the command inside it was not, the id can
+/// still be answered with.
+pub fn operation_id_of_rejected_request(bytes: &[u8]) -> u64 {
+    #[derive(Deserialize)]
+    struct EnvelopeId {
+        operation_id: u64,
+    }
+    serde_json::from_slice::<EnvelopeId>(bytes)
+        .map(|envelope| envelope.operation_id)
+        .unwrap_or(0)
+}
+
 pub fn decode_response_frame(bytes: &[u8]) -> Result<ResponseEnvelope, DaemonErrorCode> {
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(DaemonErrorCode::FrameTooLarge);
@@ -285,9 +307,11 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        decode_response_frame, validate_connect_request, validate_proxy_ping_request,
+        decode_response_frame, operation_id_of_rejected_request, validate_connect_request,
+        validate_proxy_ping_request,
         validate_tcp_ping_request, ConnectRequest, ConnectionMode, ConnectionPhase,
-        DaemonErrorCode, ProxyPingRequest, TcpPingRequest, PROTOCOL_VERSION,
+        DaemonCommand, DaemonErrorCode, ProxyPingRequest, RequestEnvelope, TcpPingRequest,
+        MAX_PING_TIMEOUT_MS, PROTOCOL_VERSION,
     };
 
     #[test]
@@ -332,6 +356,14 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_request_frame_still_answers_with_its_operation_id() {
+        let request = RequestEnvelope::new(PROTOCOL_VERSION, 4242, DaemonCommand::Status);
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert_eq!(operation_id_of_rejected_request(&bytes), 4242);
+        assert_eq!(operation_id_of_rejected_request(b"not json"), 0);
+    }
+
+    #[test]
     fn valid_tun_connect_request_is_accepted() {
         assert_eq!(validate_connect_request(&valid_connect()), Ok(()));
     }
@@ -366,6 +398,16 @@ mod tests {
             timeout_ms: 5_000,
         };
         assert_eq!(validate_proxy_ping_request(&proxy), Ok(()));
+
+        // The UDP-only budget the desktop client asks for must be accepted.
+        let mut udp_proxy = proxy.clone();
+        udp_proxy.timeout_ms = MAX_PING_TIMEOUT_MS;
+        assert_eq!(validate_proxy_ping_request(&udp_proxy), Ok(()));
+        udp_proxy.timeout_ms = MAX_PING_TIMEOUT_MS + 1;
+        assert_eq!(
+            validate_proxy_ping_request(&udp_proxy),
+            Err(DaemonErrorCode::InvalidRequest)
+        );
 
         let mut plain_dns_proxy = proxy.clone();
         plain_dns_proxy.dns_probe_urls.clear();

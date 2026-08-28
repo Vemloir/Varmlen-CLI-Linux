@@ -6,8 +6,9 @@
 
 pub mod daemon_client;
 pub mod endpoint;
-pub mod label;
 pub mod fetch;
+pub mod label;
+pub mod ping;
 pub mod split;
 pub mod subscription;
 pub mod xray;

@@ -150,7 +150,14 @@ impl DaemonClient {
         .map_err(|_| ClientError::Timeout("reading a response"))??;
         let response = decode_response_frame(&response_bytes).map_err(ClientError::Protocol)?;
         if response.operation_id != operation_id {
-            return Err(ClientError::OperationMismatch);
+            // A daemon that refuses a request while decoding it answers with the
+            // id it could salvage, which for an older daemon is 0. Its error
+            // code is the only explanation the user gets, so prefer it over an
+            // anonymous mismatch.
+            return match response.result {
+                Err(error) => Err(ClientError::from(error)),
+                Ok(_) => Err(ClientError::OperationMismatch),
+            };
         }
         response.result.map_err(ClientError::from)
     }

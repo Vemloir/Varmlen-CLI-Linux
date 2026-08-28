@@ -58,6 +58,9 @@ const PROXY_PING_URLS: &[&str] = &[
     "http://www.gstatic.com/generate_204",
     "http://cp.cloudflare.com/generate_204",
 ];
+/// A location is only reported dead after two failed probe rounds.
+const PROBE_ATTEMPTS: usize = 2;
+const PROBE_RETRY_DELAY_MS: u64 = 300;
 const DNS_PROBE_QUERY: &[u8] = &[
     0x56, 0x4d, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, b'w', b'w', b'w',
     0x07, b'g', b's', b't', b'a', b't', b'i', b'c', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
@@ -120,16 +123,16 @@ async fn probe_http_url_through_proxy(
 }
 
 async fn probe_http_through_proxy(client: &reqwest::Client) -> Result<u32, DaemonError> {
-    first_success(
+    first_success_with_reason(
         PROXY_PING_URLS
             .iter()
             .map(|url| probe_http_url_through_proxy(client, url)),
     )
     .await
-    .ok_or_else(|| {
-        DaemonError::new(
-            DaemonErrorCode::PingFailed,
+    .map_err(|failures| {
+        probe_failure(
             "every HTTP connectivity probe failed through the proxy",
+            failures,
         )
     })
 }
@@ -229,13 +232,50 @@ where
     I: IntoIterator<Item = F>,
     F: std::future::Future<Output = Result<T, E>>,
 {
+    first_success_with_reason(futures).await.ok()
+}
+
+/// First success, or every reason nothing worked.
+///
+/// "HTTP ping failed through every proxy path" is not an answer anyone can
+/// act on; a location that is down, a location whose credentials expired and a
+/// location whose DNS path is broken all looked identical. Keep the reasons.
+async fn first_success_with_reason<T, E, I, F>(futures: I) -> Result<T, Vec<E>>
+where
+    I: IntoIterator<Item = F>,
+    F: std::future::Future<Output = Result<T, E>>,
+{
     let mut pending = futures.into_iter().collect::<FuturesUnordered<_>>();
+    let mut failures = Vec::new();
     while let Some(result) = pending.next().await {
-        if let Ok(value) = result {
-            return Some(value);
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) => failures.push(error),
         }
     }
-    None
+    Err(failures)
+}
+
+/// The distinct reasons probes failed, in one bounded message.
+fn probe_failure(prefix: &str, failures: Vec<DaemonError>) -> DaemonError {
+    const MAX_REASONS: usize = 3;
+    let mut reasons: Vec<String> = Vec::new();
+    for failure in failures {
+        if !reasons.contains(&failure.message) {
+            reasons.push(failure.message);
+        }
+    }
+    let detail = if reasons.is_empty() {
+        "no probe was attempted".to_string()
+    } else {
+        reasons
+            .iter()
+            .take(MAX_REASONS)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    DaemonError::new(DaemonErrorCode::PingFailed, format!("{prefix}: {detail}"))
 }
 
 pub async fn run_tcp_ping(request: &TcpPingRequest) -> Result<u32, DaemonError> {
@@ -395,20 +435,42 @@ pub async fn run_proxy_ping(
             continue;
         }
 
-        let result = first_success(ports.iter().copied().map(|port| {
-            probe_proxy_port(
-                port,
-                Duration::from_millis(request.timeout_ms.into()),
-                &dns_probe_urls,
-            )
-        }))
-        .await
-        .ok_or_else(|| {
-            DaemonError::new(
-                DaemonErrorCode::PingFailed,
-                "HTTP ping failed through every proxy path",
-            )
-        });
+        // A healthy Hysteria2 node loses some handshakes to ordinary datagram
+        // loss and answers the next attempt in well under a second, so a single
+        // failed round used to mark live locations dead. Probe twice, keeping the
+        // reasons from the last attempt. The cost is that a genuinely dead
+        // location takes two probe budgets instead of one.
+        let mut rtt = None;
+        let mut failure = None;
+        for attempt in 0..PROBE_ATTEMPTS {
+            if attempt > 0 {
+                sleep(Duration::from_millis(PROBE_RETRY_DELAY_MS)).await;
+            }
+            match first_success_with_reason(ports.iter().copied().map(|port| {
+                probe_proxy_port(
+                    port,
+                    Duration::from_millis(request.timeout_ms.into()),
+                    &dns_probe_urls,
+                )
+            }))
+            .await
+            {
+                Ok(value) => {
+                    rtt = Some(value);
+                    break;
+                }
+                Err(reasons) => {
+                    failure = Some(probe_failure(
+                        "HTTP ping failed through every proxy path",
+                        reasons,
+                    ))
+                }
+            }
+        }
+        let result = match rtt {
+            Some(value) => Ok(value),
+            None => Err(failure.expect("a failed attempt always records a reason")),
+        };
         let _ = child.kill().await;
         let _ = child.wait().await;
         let _ = fs::remove_file(&config_path);
@@ -560,12 +622,14 @@ impl SystemLifecycleBackend {
         if output.status.success() {
             return Ok(());
         }
-        let stderr = String::from_utf8_lossy(&output.stderr);
         Err(DaemonError::new(
             DaemonErrorCode::XrayValidationFailed,
             format!(
                 "Xray rejected the generated configuration: {}",
-                stderr.trim()
+                validation_failure_detail(
+                    &String::from_utf8_lossy(&output.stdout),
+                    &String::from_utf8_lossy(&output.stderr),
+                )
             ),
         ))
     }
@@ -813,7 +877,11 @@ impl LifecycleBackend for SystemLifecycleBackend {
         self.prepare_runtime_dir()?;
         self.write_private(&self.validation_path(), &request.validation_config)?;
         self.write_private(&self.config_path(), &request.xray_config)?;
-        self.run_xray_validation(&self.config_path()).await?;
+        // A reconnect keeps the tun up, and Xray cannot be asked to create the
+        // device it is only validating; see `tun_devices_already_live`.
+        if !tun_devices_already_live(&request.xray_config, Path::new("/sys/class/net")) {
+            self.run_xray_validation(&self.config_path()).await?;
+        }
         self.run_validation_egress_probe(&request.validation_config)
             .await
     }
@@ -1042,6 +1110,71 @@ pub fn ensure_trusted_binary(path: &Path) -> Result<(), DaemonError> {
         ));
     }
     Ok(())
+}
+
+/// Why Xray refused a configuration.
+///
+/// Xray 26.x prints `Failed to start: …` on **stdout**, so an error built from
+/// stderr alone is blank for every configuration problem Xray reports — which
+/// is what made reconnects look like an anonymous "Xray rejected
+/// configuration". Both streams are reported, without the version banner.
+fn validation_failure_detail(stdout: &str, stderr: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 600;
+    let lines = stderr
+        .lines()
+        .chain(stdout.lines())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            !line.starts_with("Xray ")
+                && !line.starts_with("A unified platform")
+                && !line.contains("Reading config:")
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return "no explanation was written by Xray".to_string();
+    }
+    let detail = lines.join(" | ");
+    if detail.chars().count() <= MAX_DETAIL_CHARS {
+        return detail;
+    }
+    let keep = detail.chars().count() - MAX_DETAIL_CHARS;
+    format!("…{}", &detail[keep..])
+}
+
+/// TUN interface names the configuration asks Xray to create.
+fn configured_tun_devices(raw: &str) -> Vec<String> {
+    let Ok(document) = serde_json::from_str::<Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(inbounds) = document.get("inbounds").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    inbounds
+        .iter()
+        .filter(|inbound| inbound.get("protocol").and_then(Value::as_str) == Some("tun"))
+        .filter_map(|inbound| {
+            inbound
+                .get("settings")
+                .and_then(|settings| settings.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Whether every TUN device the configuration needs already exists.
+///
+/// Xray up to 26.3.x creates the TUN device while it is only *testing* a
+/// configuration. A reconnect validates before the previous data plane is
+/// stopped — deliberately, so a broken candidate never tears down a working
+/// tunnel — so the interface is still up and `-test` fails with `device or
+/// resource busy` for a configuration that is perfectly valid. The egress probe
+/// that follows starts a real Xray through the same profile and is the stronger
+/// check, so the tun-bound syntax pass is skipped while the device is live.
+fn tun_devices_already_live(raw: &str, sysfs_net: &Path) -> bool {
+    let devices = configured_tun_devices(raw);
+    !devices.is_empty() && devices.iter().all(|name| sysfs_net.join(name).exists())
 }
 
 fn validation_config_ports(raw: &str) -> Result<Vec<u16>, DaemonError> {
@@ -1579,11 +1712,13 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_proxy_dns_probe_request, build_proxy_ping_request, first_success,
+        build_proxy_dns_probe_request, build_proxy_ping_request, configured_tun_devices,
+        first_success, first_success_with_reason, probe_failure, tun_devices_already_live,
         validate_dns_probe_response, validate_ping_xray_document, validate_xray_document,
-        validation_config_ports, validation_config_with_ports, DNS_PROBE_QUERY, PROXY_PING_URLS,
+        validation_config_ports, validation_config_with_ports, validation_failure_detail,
+        DNS_PROBE_QUERY, PROXY_PING_URLS,
     };
-    use crate::protocol::DaemonErrorCode;
+    use crate::protocol::{DaemonError, DaemonErrorCode};
 
     fn config(data: serde_json::Value) -> String {
         json!({
@@ -1631,6 +1766,95 @@ mod tests {
         assert_eq!(value["inbounds"][0]["port"], 43123);
         assert_eq!(value["inbounds"][1]["port"], 43124);
         assert_eq!(value["inbounds"][0]["listen"], "127.0.0.1");
+    }
+
+    #[test]
+    fn xray_validation_failure_is_reported_from_stdout() {
+        // Xray 26.x writes the reason to stdout and leaves stderr empty; the
+        // version banner is noise the user does not need twice.
+        let stdout = "Xray 26.3.27 (Xray, Penetrates Everything.) d2758a0\nA unified platform for anti-censorship.\n2026/08/28 03:46:56 [Info] infra/conf/serial: Reading config: &{Name:/run/varmlen/user-1000/xray.json Format:json}\nFailed to start: main: failed to create server > device or resource busy\n";
+        assert_eq!(
+            validation_failure_detail(stdout, ""),
+            "Failed to start: main: failed to create server > device or resource busy"
+        );
+        assert_eq!(
+            validation_failure_detail("", "broken json\n"),
+            "broken json"
+        );
+        assert_eq!(
+            validation_failure_detail("Xray 26.3.27\n", ""),
+            "no explanation was written by Xray"
+        );
+    }
+
+    #[test]
+    fn reconnect_does_not_recreate_the_live_tun_device() {
+        let raw = config(json!({
+            "tag": "tun-in",
+            "protocol": "tun",
+            "settings": {"name": "varmlen0", "mtu": 1500}
+        }));
+        assert_eq!(configured_tun_devices(&raw), vec!["varmlen0".to_string()]);
+
+        let sysfs = tempfile::tempdir().unwrap();
+        // A cold start has no interface, so Xray still validates the config.
+        assert!(!tun_devices_already_live(&raw, sysfs.path()));
+        // A reconnect keeps the interface up: `-test` would only fail because
+        // the device name is taken, which is not a configuration error.
+        std::fs::create_dir(sysfs.path().join("varmlen0")).unwrap();
+        assert!(tun_devices_already_live(&raw, sysfs.path()));
+    }
+
+    #[test]
+    fn tun_syntax_pass_survives_a_proxy_only_config() {
+        let raw = config(json!({
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": 2081,
+            "settings": {"auth": "noauth", "udp": true}
+        }));
+        let sysfs = tempfile::tempdir().unwrap();
+        std::fs::create_dir(sysfs.path().join("varmlen0")).unwrap();
+        assert!(configured_tun_devices(&raw).is_empty());
+        assert!(!tun_devices_already_live(&raw, sysfs.path()));
+    }
+
+    /// A probe outcome that is already decided, shaped like a real probe.
+    async fn answered(result: Result<u32, DaemonError>) -> Result<u32, DaemonError> {
+        result
+    }
+
+    fn ping_failure(reason: &'static str) -> DaemonError {
+        DaemonError::new(DaemonErrorCode::PingFailed, reason)
+    }
+
+    #[tokio::test]
+    async fn failed_probes_keep_their_reasons() {
+        let failures = first_success_with_reason(vec![
+            answered(Err(ping_failure("dns path down"))),
+            answered(Err(ping_failure("connection refused"))),
+            answered(Err(ping_failure("dns path down"))),
+        ])
+        .await
+        .expect_err("every probe failed");
+        let error = probe_failure("every probe failed", failures);
+        assert_eq!(error.code, DaemonErrorCode::PingFailed);
+        assert_eq!(
+            error.message,
+            "every probe failed: dns path down; connection refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_probe_hides_the_losing_probes() {
+        let rtt = first_success_with_reason(vec![
+            answered(Err(ping_failure("slow path"))),
+            answered(Ok(41)),
+        ])
+        .await
+        .expect("one path answered");
+        assert_eq!(rtt, 41);
     }
 
     #[test]

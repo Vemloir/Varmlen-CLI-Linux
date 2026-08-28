@@ -20,17 +20,21 @@ use clap::{Args, Parser, Subcommand};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use varmlen_core::daemon_client::DaemonClient;
+use varmlen_core::daemon_client::{ClientError, DaemonClient};
 use varmlen_core::endpoint::resolve_server_ips;
 use varmlen_core::fetch::fetch_subscription;
 use varmlen_core::label::transport_summary;
+use varmlen_core::ping::{
+    proxy_ping_timeout_ms, supports_tcp_endpoint_ping, PROXY_PING_TIMEOUT_MS,
+};
 use varmlen_core::split::SplitInput;
 use varmlen_core::subscription::{parse_proxy_uri, VlessServer};
 use varmlen_core::xray::{
     build_connection_probe_config, build_ping_config, generate_xray_config, ping_placeholder_ports,
 };
 use varmlend::protocol::{
-    ConnectRequest, ConnectionMode, DaemonCommand, DaemonState, ProxyPingRequest, TcpPingRequest,
+    ConnectRequest, ConnectionMode, DaemonCommand, DaemonErrorCode, DaemonState, ProxyPingRequest,
+    TcpPingRequest,
 };
 
 use config::{location_key, Config, Location, Subscription};
@@ -142,9 +146,12 @@ struct PingArgs {
     /// through the proxy. Faster, but says nothing about the proxy itself.
     #[arg(long)]
     tcp: bool,
-    /// Timeout per probe, in milliseconds.
-    #[arg(long, default_value_t = 5000, value_parser = clap::value_parser!(u32).range(100..=10_000))]
-    timeout: u32,
+    /// Timeout per probe round, in milliseconds. Defaults to 5000, or 15000 for
+    /// a UDP transport (Hysteria2 and QUIC pay a handshake on top of the probe).
+    /// A location is only declared dead after two rounds, so the ceiling keeps
+    /// the pair inside the daemon's own command timeout.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(100..=20_000))]
+    timeout: Option<u32>,
     /// What to probe: a location (by number from `list` or by name), a
     /// subscription name to cover everything in it, or `all`. Defaults to the
     /// last location connected to.
@@ -635,7 +642,14 @@ async fn ping(config: &Config, args: PingArgs, scope: Scope) -> Result<()> {
     // dominated by the timeouts of whichever locations are down. Proxy probes
     // each cost the daemon a throwaway xray process, so they run far fewer at a
     // time than bare handshakes.
-    let limit = if args.tcp { 16 } else { 4 };
+    // `--tcp` still has to fall back to a proxy probe on the UDP locations, and
+    // those are the expensive kind, so the wide window only applies when every
+    // target really answers a bare handshake.
+    let bare_tcp = args.tcp
+        && indices
+            .iter()
+            .all(|index| supports_tcp_endpoint_ping(&config.locations[*index].server));
+    let limit = if bare_tcp { 16 } else { 4 };
     let permits = Arc::new(Semaphore::new(limit));
     let mut tasks = JoinSet::new();
     for (position, index) in indices.iter().enumerate() {
@@ -731,32 +745,69 @@ fn compact(error: &anyhow::Error) -> String {
     text.rsplit(": ").next().unwrap_or(&text).to_string()
 }
 
-async fn probe(server: &VlessServer, tcp: bool, timeout: u32) -> Result<u32> {
-    let command = if tcp {
-        DaemonCommand::TcpPing(TcpPingRequest {
-            host: server.host.clone(),
-            port: server.port,
-            timeout_ms: timeout,
-        })
-    } else {
-        // The daemon reserves real loopback ports and rewrites the template,
-        // so these are placeholders that only have to be distinct.
-        let ports = ping_placeholder_ports(server).map_err(|error| anyhow::anyhow!("{error}"))?;
-        let config = build_ping_config(server, &ports).map_err(|error| anyhow::anyhow!("{error}"))?;
-        DaemonCommand::ProxyPing(ProxyPingRequest {
-            xray_config: serde_json::to_string(&config)?,
-            socks_port: ports[0],
-            socks_ports: ports,
-            dns_probe_urls: Vec::new(),
-            timeout_ms: timeout,
-        })
-    };
-    // A fresh connection per probe: a daemon-side failure must not leave the
-    // rest of an --all run talking over a connection in an unknown state.
+/// The ping ceiling of a daemon built before UDP probes were given 15 s.
+///
+/// Upgrading the client never interrupts a running tunnel, so the daemon that
+/// is still answering may be the old one. Its ceiling used to turn every
+/// Hysteria2 probe into a rejection, so step down to it instead of reporting a
+/// live location as unpingable.
+const LEGACY_MAX_PING_TIMEOUT_MS: u32 = 10_000;
+
+fn proxy_ping_command(server: &VlessServer, timeout: u32) -> Result<DaemonCommand> {
+    // The daemon reserves real loopback ports and rewrites the template, so
+    // these are placeholders that only have to be distinct.
+    let ports = ping_placeholder_ports(server).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let config = build_ping_config(server, &ports).map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(DaemonCommand::ProxyPing(ProxyPingRequest {
+        xray_config: serde_json::to_string(&config)?,
+        socks_port: ports[0],
+        socks_ports: ports,
+        dns_probe_urls: Vec::new(),
+        timeout_ms: timeout,
+    }))
+}
+
+/// Ask the daemon one thing and read the round-trip time back.
+///
+/// A fresh connection per probe: a daemon-side failure must not leave the rest
+/// of an `--all` run talking over a connection in an unknown state.
+async fn send(command: DaemonCommand) -> Result<u32> {
     let state = daemon().await?.request(command).await?;
     state
         .rtt_ms
         .ok_or_else(|| anyhow::anyhow!("daemon returned no round-trip time"))
+}
+
+async fn probe(server: &VlessServer, tcp: bool, timeout: Option<u32>) -> Result<u32> {
+    // A UDP endpoint listens on UDP, so a bare TCP handshake there measures the
+    // absence of a protocol rather than the location. Probe the proxy instead,
+    // exactly as the desktop client does.
+    let tcp = tcp && supports_tcp_endpoint_ping(server);
+    let timeout = timeout.unwrap_or(if tcp {
+        PROXY_PING_TIMEOUT_MS
+    } else {
+        proxy_ping_timeout_ms(server)
+    });
+    if tcp {
+        return send(DaemonCommand::TcpPing(TcpPingRequest {
+            host: server.host.clone(),
+            port: server.port,
+            timeout_ms: timeout,
+        }))
+        .await;
+    }
+    let error = match send(proxy_ping_command(server, timeout)?).await {
+        Ok(rtt) => return Ok(rtt),
+        Err(error) => error,
+    };
+    let rejected_by_an_old_daemon = matches!(
+        error.downcast_ref::<ClientError>(),
+        Some(ClientError::Daemon(DaemonErrorCode::InvalidRequest, _))
+    );
+    if rejected_by_an_old_daemon && timeout > LEGACY_MAX_PING_TIMEOUT_MS {
+        return send(proxy_ping_command(server, LEGACY_MAX_PING_TIMEOUT_MS)?).await;
+    }
+    Err(error)
 }
 
 fn split(config: &mut Config, command: SplitCommand) -> Result<Section> {
