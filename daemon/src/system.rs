@@ -104,6 +104,30 @@ fn validate_dns_probe_response(body: &[u8]) -> Result<(), DaemonError> {
     Ok(())
 }
 
+/// The reason a probe request failed, without reqwest repeating the URL.
+///
+/// `Display` for a reqwest error is "error sending request for url (...)"; the
+/// transport cause that actually says anything -- refused, reset, timed out --
+/// is deeper in the source chain, and clients show the tail of a probe message,
+/// so that tail has to be the reason.
+fn probe_reason(error: &reqwest::Error) -> String {
+    let mut reason = error.to_string();
+    let mut cause = std::error::Error::source(error);
+    while let Some(next) = cause {
+        reason = next.to_string();
+        cause = next.source();
+    }
+    reason
+}
+
+/// The host of a probe target, which is the part worth naming in a message.
+fn probe_host(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+        .unwrap_or_else(|| url.to_string())
+}
+
 async fn probe_http_url_through_proxy(
     client: &reqwest::Client,
     url: &str,
@@ -115,7 +139,7 @@ async fn probe_http_url_through_proxy(
         .map_err(|error| {
             DaemonError::new(
                 DaemonErrorCode::PingFailed,
-                format!("HTTP ping {url} failed: {error}"),
+                format!("{}: {}", probe_host(url), probe_reason(&error)),
             )
         })?;
     if response.status().as_u16() != 204 {
@@ -152,7 +176,10 @@ async fn probe_dns_url_through_proxy(
         .map_err(|error| {
             DaemonError::new(
                 DaemonErrorCode::PingFailed,
-                format!("DNS probe {url} failed: {error}"),
+                // `{:?}` on purpose: reqwest's Display names the URL again and
+                // hides the transport reason, and clients show the last segment
+                // of the message -- which then has to be the reason.
+                format!("resolver {}: {}", probe_host(url), probe_reason(&error)),
             )
         })?;
     if response.status().as_u16() != 200 {
