@@ -58,6 +58,11 @@ const PROXY_PING_URLS: &[&str] = &[
     "http://www.gstatic.com/generate_204",
     "http://cp.cloudflare.com/generate_204",
 ];
+/// How long the profile's resolver may take to answer before the strict probe
+/// round gives up on it. A resolver that is refused by the provider should cost
+/// this much of the probe, not the whole latency budget: the second round
+/// measures the location either way.
+const RESOLVER_PROBE_BUDGET: Duration = Duration::from_secs(5);
 /// A location is only reported dead after two failed probe rounds.
 const PROBE_ATTEMPTS: usize = 2;
 const PROBE_RETRY_DELAY_MS: u64 = 300;
@@ -215,18 +220,36 @@ async fn probe_proxy_port(
     port: u16,
     timeout_duration: Duration,
     dns_probe_urls: &[String],
+    require_dns: bool,
 ) -> Result<u32, DaemonError> {
     let client = proxy_probe_client(port, timeout_duration)?;
-    if dns_probe_urls.is_empty() {
+    if dns_probe_urls.is_empty() || !require_dns {
         return probe_http_through_proxy(&client).await;
     }
-    let (http_rtt, ()) = tokio::try_join!(
-        probe_http_through_proxy(&client),
-        probe_dns_through_proxy(&client, dns_probe_urls),
-    )?;
+    // Both legs run concurrently, so the reported figure stays the HTTP RTT
+    // rather than an HTTP round trip plus a resolver round trip. The resolver
+    // leg gets its own shorter budget, and `try_join!` then abandons the whole
+    // path as soon as the resolver refuses to answer: a path that cannot pass
+    // the strict round has nothing left to prove by finishing a web request.
+    let resolver = async {
+        tokio::time::timeout(
+            timeout_duration.min(RESOLVER_PROBE_BUDGET),
+            probe_dns_through_proxy(&client, dns_probe_urls),
+        )
+        .await
+        .map_err(|_| {
+            DaemonError::new(
+                DaemonErrorCode::PingFailed,
+                format!(
+                    "the profile's resolver did not answer within {} s through this path",
+                    RESOLVER_PROBE_BUDGET.as_secs()
+                ),
+            )
+        })?
+    };
+    let (http_rtt, ()) = tokio::try_join!(probe_http_through_proxy(&client), resolver)?;
     Ok(http_rtt)
 }
-
 async fn first_success<T, E, I, F>(futures: I) -> Option<T>
 where
     I: IntoIterator<Item = F>,
@@ -435,35 +458,48 @@ pub async fn run_proxy_ping(
             continue;
         }
 
-        // A healthy Hysteria2 node loses some handshakes to ordinary datagram
-        // loss and answers the next attempt in well under a second, so a single
-        // failed round used to mark live locations dead. Probe twice, keeping the
-        // reasons from the last attempt. The cost is that a genuinely dead
-        // location takes two probe budgets instead of one.
+        // Two rounds, and the second one asks less than the first.
+        //
+        // The first round requires the profile's own resolver to answer through
+        // the same concrete path, so a location is only reported healthy when
+        // the whole profile works over it. A round that fails can mean two very
+        // different things: the path carried nothing, or it carried everything
+        // except that resolver -- a provider refusing the resolver it does not
+        // sell is normal, and Quad9 answered `505` to the probe outright until
+        // the client learned to offer HTTP/2. Repeating the resolver leg would
+        // get the same answer, so the second round measures what the location
+        // can answer for: latency through the proxy.
+        //
+        // The retry also covers a healthy Hysteria2 node losing a handshake to
+        // ordinary datagram loss, which used to be enough to mark it dead.
+        let budget = Duration::from_millis(request.timeout_ms.into());
         let mut rtt = None;
-        let mut failure = None;
+        let mut failure: Option<DaemonError> = None;
         for attempt in 0..PROBE_ATTEMPTS {
             if attempt > 0 {
                 sleep(Duration::from_millis(PROBE_RETRY_DELAY_MS)).await;
             }
-            match first_success_with_reason(ports.iter().copied().map(|port| {
-                probe_proxy_port(
-                    port,
-                    Duration::from_millis(request.timeout_ms.into()),
-                    &dns_probe_urls,
-                )
-            }))
+            let require_dns = attempt == 0;
+            match first_success_with_reason(
+                ports
+                    .iter()
+                    .copied()
+                    .map(|port| probe_proxy_port(port, budget, &dns_probe_urls, require_dns)),
+            )
             .await
             {
                 Ok(value) => {
                     rtt = Some(value);
                     break;
                 }
+                // The last round's reason is the one worth reporting: it was
+                // measured without the resolver leg, so it says something about
+                // the location rather than about the profile's DNS.
                 Err(reasons) => {
                     failure = Some(probe_failure(
                         "HTTP ping failed through every proxy path",
                         reasons,
-                    ))
+                    ));
                 }
             }
         }
@@ -1827,6 +1863,23 @@ mod tests {
 
     fn ping_failure(reason: &'static str) -> DaemonError {
         DaemonError::new(DaemonErrorCode::PingFailed, reason)
+    }
+
+    /// The resolver leg of the probe speaks DNS over HTTPS, and Quad9 -- the
+    /// resolver every profile without an explicit one falls back to -- answers
+    /// a HTTP/1.1 `application/dns-message` POST with `505` and a STALE-encoded
+    /// body. The probe requires that leg to pass, so while ALPN never offered
+    /// h2 every location on the default resolver reported n/a through a proxy
+    /// that was carrying its traffic fine. `http2_prior_knowledge` only exists
+    /// when reqwest's `http2` feature is enabled, which makes this test a
+    /// compile-time guard on the feature list in Cargo.toml.
+    #[test]
+    fn the_probe_client_offers_http2_to_doh_resolvers() {
+        let client = reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .build()
+            .expect("a DoH-capable probe client");
+        drop(client);
     }
 
     #[tokio::test]

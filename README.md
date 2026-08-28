@@ -137,9 +137,12 @@ number beside one is the number to hand to `connect`.
 
 The default probe goes through the proxy — the daemon starts a throwaway xray
 on ports it reserves itself and times a real request, so the figure includes the
-TLS handshake and the proxy's own latency. `--tcp` times only the handshake to
-the endpoint, which says whether the host answers but nothing about the tunnel.
-Neither touches the current connection.
+TLS handshake and the proxy's own latency. When the profile names a
+DNS-over-HTTPS resolver the same probe also asks that resolver a name through
+the same path, because a location that carries traffic but cannot reach its own
+resolver is not healthy; a refusal to answer is reported as the reason. `--tcp`
+times only the handshake to the endpoint, which says whether the host answers
+but nothing about the tunnel. Neither touches the current connection.
 
 Configuration lives in `~/.config/varmlen/cli.json` (`varmlen-cli config-path`).
 It holds proxy credentials, so it is written `0600` in a `0700` directory.

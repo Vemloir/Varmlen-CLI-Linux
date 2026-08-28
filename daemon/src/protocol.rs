@@ -308,10 +308,9 @@ mod tests {
 
     use super::{
         decode_response_frame, operation_id_of_rejected_request, validate_connect_request,
-        validate_proxy_ping_request,
-        validate_tcp_ping_request, ConnectRequest, ConnectionMode, ConnectionPhase,
-        DaemonCommand, DaemonErrorCode, ProxyPingRequest, RequestEnvelope, TcpPingRequest,
-        MAX_PING_TIMEOUT_MS, PROTOCOL_VERSION,
+        validate_proxy_ping_request, validate_tcp_ping_request, ConnectRequest, ConnectionMode,
+        ConnectionPhase, DaemonCommand, DaemonErrorCode, ProxyPingRequest, RequestEnvelope,
+        TcpPingRequest, MAX_PING_TIMEOUT_MS, PROTOCOL_VERSION,
     };
 
     #[test]
@@ -411,7 +410,10 @@ mod tests {
 
         let mut plain_dns_proxy = proxy.clone();
         plain_dns_proxy.dns_probe_urls.clear();
-        assert_eq!(plain_dns_proxy.effective_dns_probe_urls(), Vec::<String>::new());
+        assert_eq!(
+            plain_dns_proxy.effective_dns_probe_urls(),
+            Vec::<String>::new()
+        );
         assert_eq!(validate_proxy_ping_request(&plain_dns_proxy), Ok(()));
 
         let mut invalid_dns = proxy.clone();
