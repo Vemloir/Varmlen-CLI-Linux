@@ -16,7 +16,8 @@ fn protocol_label(protocol: &str) -> String {
     }
 }
 
-/// e.g. `VLESS / TCP`, `VLESS / TCP / JSON`, `Trojan / WS / TLS`, `Hysteria2`.
+/// e.g. `VLESS / TCP`, `VLESS / TCP / JSON`, `Trojan / WS / TLS`, `Hysteria2`,
+/// `Hysteria2 / JSON`.
 ///
 /// `reality` is deliberately omitted: it is the default for the locations that
 /// use it and carries no information for the reader.
@@ -28,11 +29,17 @@ pub fn transport_summary(server: &VlessServer) -> String {
             .and_then(|outbound| outbound.get("settings"))
             .and_then(|settings| settings.get("version"))
             .and_then(|version| version.as_u64());
-        return if version == Some(2) {
+        // Hysteria names its own transport, but a JSON-backed location still
+        // needs the JSON marker: it is edited as a provider profile, not a URI.
+        let mut parts = vec![if version == Some(2) {
             "Hysteria2".to_string()
         } else {
             "Hysteria".to_string()
-        };
+        }];
+        if server.source_json.is_some() {
+            parts.push("JSON".to_string());
+        }
+        return parts.join(" / ");
     }
 
     let mut parts = vec![
@@ -91,5 +98,16 @@ mod tests {
         assert_eq!(transport_summary(&location), "Hysteria");
         location.raw_outbound = Some(serde_json::json!({"settings": {"version": 2}}));
         assert_eq!(transport_summary(&location), "Hysteria2");
+    }
+
+    #[test]
+    fn json_marker_covers_hysteria_too() {
+        let mut location = server(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?type=tcp#Loc",
+        );
+        location.protocol = "hysteria".to_string();
+        location.raw_outbound = Some(serde_json::json!({"settings": {"version": 2}}));
+        location.source_json = Some("{}".to_string());
+        assert_eq!(transport_summary(&location), "Hysteria2 / JSON");
     }
 }
