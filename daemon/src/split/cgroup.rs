@@ -83,13 +83,47 @@ impl BypassCgroup {
     }
 
     pub fn move_pid(&self, pid: u32) -> Result<(), SplitError> {
+        self.move_pid_to(&self.procs_path(), pid)
+    }
+
+    /// Whether a process is already held by the bypass cgroup.
+    pub fn contains_pid(&self, pid: u32) -> bool {
+        crate::split::process::cgroup(pid).ok().is_some_and(|path| {
+            let path = path.trim_start_matches('/');
+            path == self.relative_path().trim_start_matches('/')
+        })
+    }
+
+    /// The PIDs currently held by the bypass cgroup.
+    pub fn member_pids(&self) -> Vec<u32> {
+        std::fs::read_to_string(self.procs_path())
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect()
+    }
+
+    /// Put a process back on the tunneled path.
+    ///
+    /// Processes land in a leaf of our own rather than being handed back to
+    /// whatever systemd scope they came from: only membership of the bypass
+    /// cgroup decides whether a socket is marked, so any other cgroup means
+    /// "through the tunnel", and rewriting a sandbox's own scope would leave
+    /// systemd tracking a process that is no longer there.
+    pub fn move_out(&self, pid: u32) -> Result<(), SplitError> {
+        let tunneled = self.path.parent().unwrap_or(&self.path).join("tunneled");
+        create_real_directory(&tunneled)?;
+        self.move_pid_to(&tunneled.join("cgroup.procs"), pid)
+    }
+
+    fn move_pid_to(&self, procs_path: &Path, pid: u32) -> Result<(), SplitError> {
         if real_uid(pid)? != self.owner_uid {
             return Err(SplitError::ReconciliationFailed);
         }
         let mut procs = OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(self.procs_path())
+            .open(procs_path)
             .map_err(|_| SplitError::ReconciliationFailed)?;
         procs
             .write_all(pid.to_string().as_bytes())

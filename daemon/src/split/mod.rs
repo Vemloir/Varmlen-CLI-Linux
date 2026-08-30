@@ -53,6 +53,12 @@ pub trait SplitBackend {
     async fn install_route_rules(&mut self) -> Result<(), SplitError>;
     async fn start_permission_watcher(&mut self, plan: &SplitPlan) -> Result<(), SplitError>;
     async fn reconcile_existing(&mut self, plan: &SplitPlan) -> Result<(), SplitError>;
+    /// Point a live split at a new set of applications.
+    ///
+    /// Rules are otherwise read at connect only, which makes editing the
+    /// exception list look inert: the application keeps bypassing, or keeps
+    /// not bypassing, until the tunnel is cycled.
+    async fn update_plan(&mut self, plan: &SplitPlan) -> Result<(), SplitError>;
     async fn rollback(&mut self) -> Result<(), SplitError>;
 }
 
@@ -99,6 +105,18 @@ impl<B: SplitBackend> SplitManager<B> {
         self.status = SplitStatus::Active;
         Ok(())
     }
+
+    /// Point a live split at a new exception list, keeping the tunnel up.
+    ///
+    /// Returns whether anything was live to change.  With no split running the
+    /// plan is simply the one the next connect will apply.
+    pub async fn update_plan(&mut self, plan: SplitPlan) -> Result<bool, SplitError> {
+        if !matches!(self.status, SplitStatus::Active) {
+            return Ok(false);
+        }
+        self.backend.update_plan(&plan).await?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +132,7 @@ mod tests {
         bpf_attached: bool,
         routes_installed: bool,
         rolled_back: bool,
+        plans: Vec<SplitPlan>,
     }
 
     #[async_trait]
@@ -144,12 +163,38 @@ mod tests {
             Ok(())
         }
 
+        async fn update_plan(&mut self, plan: &SplitPlan) -> Result<(), SplitError> {
+            self.plans.push(plan.clone());
+            Ok(())
+        }
+
         async fn rollback(&mut self) -> Result<(), SplitError> {
             self.rolled_back = true;
             self.bpf_attached = false;
             self.routes_installed = false;
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn a_live_update_only_reaches_a_live_split() {
+        let mut manager = SplitManager::new(FakeSplitBackend::default());
+        let updated = manager
+            .update_plan(SplitPlan::new(1000, vec!["REPO.exe".into()]))
+            .await
+            .expect("a split that is not running is not an error to edit");
+        assert!(!updated, "nothing was live, so nothing was re-pointed");
+
+        manager
+            .apply(SplitPlan::new(1000, vec!["cs2".into()]))
+            .await
+            .expect("split should apply");
+        let updated = manager
+            .update_plan(SplitPlan::new(1000, vec!["REPO.exe".into()]))
+            .await
+            .expect("a live split should accept a new list");
+        assert!(updated);
+        assert_eq!(manager.status(), SplitStatus::Active);
     }
 
     #[tokio::test]

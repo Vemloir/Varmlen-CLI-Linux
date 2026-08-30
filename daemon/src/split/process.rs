@@ -50,17 +50,37 @@ impl AppSelector {
                     return command_words(&process.arguments)
                         .any(|word| argument_is_named(word, name));
                 }
-                // A rule that reads like an application id matches the sandbox
-                // scope that Flatpak, Snap and systemd name every member of
-                // the application after, which is the only identity a
-                // sandboxed app reliably has: its processes are `sobrun`,
-                // `WebCore` and `VulkanAppHost`, and its scope is
-                // `app-flatpak-org.vinegarhq.Sober-<pid>.scope`.
-                if is_application_id(name) {
-                    return process.cgroup_paths_contain(name);
-                }
                 false
             }
+        }
+    }
+
+    /// The sandbox application this rule claims the process belongs to.
+    ///
+    /// Flatpak, Snap and systemd name every process of a sandboxed application
+    /// after the application, in its scope: `app-flatpak-org.vinegarhq.Sober`
+    /// `<pid>`.scope.  That is the only identity such an application offers --
+    /// its processes are called `sobrun`, `WebCore` and `VulkanAppHost` -- and
+    /// the answer is *consumed by the move itself*: a process that leaves for
+    /// the bypass cgroup no longer carries the scope it matched on.  Whoever
+    /// moves a process on this must therefore remember what it matched on, or
+    /// the next pass will see a process that matches nothing and undo it.
+    /// The application id this rule would claim, if it is an application id.
+    pub fn application_id(&self) -> Option<&str> {
+        match self {
+            Self::ExactPath(_) => None,
+            Self::ProcessName(name) if is_application_id(name) => Some(name),
+            Self::ProcessName(_) => None,
+        }
+    }
+
+    pub fn matched_application_id(&self, process: &ProcessSnapshot) -> Option<String> {
+        match self {
+            Self::ExactPath(_) => None,
+            Self::ProcessName(name) if is_application_id(name) => {
+                process.cgroup_paths_contain(name).then(|| name.to_string())
+            }
+            Self::ProcessName(_) => None,
         }
     }
 
@@ -101,10 +121,16 @@ fn is_windows_image(name: &str) -> bool {
         .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("exe"))
 }
 
-/// Whether a rule reads like a Flatpak or Snap application id rather than a
-/// program name (`org.vinegarhq.Sober`, `com.valvesoftware.Steam`).
+/// Whether a rule reads like a sandbox application id rather than a program
+/// name (`org.vinegarhq.Sober`, `com.valvesoftware.Steam`).
+///
+/// Reverse-domain form, three components or more: that is what scopes are
+/// built from, and it is what keeps `REPO.exe` -- which is also full of dots --
+/// a Windows image rule rather than a scope claim.
 fn is_application_id(name: &str) -> bool {
-    name.contains('.') && !name.contains('-')
+    !name.contains('-')
+        && !is_windows_image(name)
+        && name.split('.').filter(|part| !part.is_empty()).count() >= 3
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -383,11 +409,37 @@ mod tests {
             &["/home/daniil/.var/app/org.vinegarhq.Sober/data/sober/versions/1/sobrun"],
             "/user.slice/user-1000.slice/user@1000.service/app.slice/app-flatpak-org.vinegarhq.Sober-2094669190.scope",
         );
-        assert!(matches("org.vinegarhq.Sober", &sandboxed));
+        assert_eq!(
+            AppSelector::parse("org.vinegarhq.Sober")
+                .unwrap()
+                .matched_application_id(&sandboxed),
+            Some("org.vinegarhq.Sober".to_string())
+        );
         // The same sandbox must not answer to a different application id.
-        assert!(!matches("org.mozilla.Firefox", &sandboxed));
+        assert_eq!(
+            AppSelector::parse("org.mozilla.Firefox")
+                .unwrap()
+                .matched_application_id(&sandboxed),
+            None
+        );
+        // A scope claim is asked for on its own, because moving the process
+        // erases the scope: the watcher, which cannot afford to re-derive it,
+        // is left with the identities that survive the move.
+        assert!(!matches("org.vinegarhq.Sober", &sandboxed));
         // And the bare name still matches the process itself.
         assert!(matches("sobrun", &sandboxed));
+    }
+
+    #[test]
+    fn only_an_application_id_rule_carries_a_scope_claim() {
+        let plain = AppSelector::parse("REPO.exe").unwrap();
+        assert_eq!(plain.application_id(), None);
+        assert_eq!(
+            AppSelector::parse("org.vinegarhq.Sober")
+                .unwrap()
+                .application_id(),
+            Some("org.vinegarhq.Sober")
+        );
     }
 
     #[test]

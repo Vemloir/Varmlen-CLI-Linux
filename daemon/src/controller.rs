@@ -106,6 +106,9 @@ impl CommandHandler for SystemController {
             DaemonCommand::Status => manager.reconcile_health().await,
             DaemonCommand::Connect(request) => manager.connect(request).await,
             DaemonCommand::Disconnect => manager.disconnect().await,
+            DaemonCommand::UpdateSplit(applications) => {
+                manager.update_split(applications.applications).await
+            }
             DaemonCommand::TcpPing(_)
             | DaemonCommand::ProxyPing(_)
             | DaemonCommand::LogTail

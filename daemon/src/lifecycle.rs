@@ -13,6 +13,9 @@ pub trait LifecycleBackend {
     async fn stop_data_plane(&mut self, preserve_split: bool) -> Result<(), DaemonError>;
     async fn start_data_plane(&mut self, request: &ConnectRequest) -> Result<(), DaemonError>;
     async fn activate_network(&mut self, request: &ConnectRequest) -> Result<(), DaemonError>;
+    /// Re-resolve the per-app exception list against a tunnel that is already
+    /// up.  Returns whether split tunnelling is live afterwards.
+    async fn update_split(&mut self, applications: Vec<String>) -> Result<bool, DaemonError>;
     async fn verify_connection(&mut self, request: &ConnectRequest) -> Result<(), DaemonError>;
     async fn remove_hold_block(&mut self) -> Result<(), DaemonError>;
 }
@@ -150,6 +153,26 @@ impl<B: LifecycleBackend> LifecycleManager<B> {
         Ok(self.state.clone())
     }
 
+    /// Apply an edited exception list without dropping the tunnel.
+    ///
+    /// Split rules used to be read at connect only, so `varmlen-cli split apps
+    /// add` looked inert until the tunnel was cycled, and an application that
+    /// had been removed from the list kept bypassing.
+    pub async fn update_split(
+        &mut self,
+        applications: Vec<String>,
+    ) -> Result<DaemonState, DaemonError> {
+        if !matches!(self.state.phase, ConnectionPhase::Connected) {
+            return Err(DaemonError::new(
+                DaemonErrorCode::InvalidRequest,
+                "the tunnel is not connected",
+            ));
+        }
+        let split_active = self.backend.update_split(applications).await?;
+        self.state.split_active = split_active;
+        Ok(self.state.clone())
+    }
+
     pub async fn disconnect(&mut self) -> Result<DaemonState, DaemonError> {
         let data_plane = self.backend.stop_data_plane(false).await;
         let hold_block = self.backend.remove_hold_block().await;
@@ -219,6 +242,7 @@ mod tests {
         StopFully,
         Start,
         Activate,
+        UpdateSplit,
         VerifyConnection,
         RemoveHold,
     }
@@ -294,6 +318,11 @@ mod tests {
 
         async fn activate_network(&mut self, _request: &ConnectRequest) -> Result<(), DaemonError> {
             self.record(Action::Activate)
+        }
+
+        async fn update_split(&mut self, applications: Vec<String>) -> Result<bool, DaemonError> {
+            self.record(Action::UpdateSplit)?;
+            Ok(!applications.is_empty())
         }
 
         async fn verify_connection(

@@ -12,7 +12,6 @@ mod config;
 mod display;
 mod setup;
 
-
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -33,8 +32,8 @@ use varmlen_core::xray::{
     build_connection_probe_config, build_ping_config, generate_xray_config, ping_placeholder_ports,
 };
 use varmlend::protocol::{
-    ConnectRequest, ConnectionMode, DaemonCommand, DaemonErrorCode, DaemonState, ProxyPingRequest,
-    TcpPingRequest,
+    ApplicationsRequest, ConnectRequest, ConnectionMode, DaemonCommand, DaemonErrorCode,
+    DaemonState, ProxyPingRequest, TcpPingRequest,
 };
 
 use config::{location_key, Config, Location, Subscription};
@@ -309,6 +308,9 @@ async fn run() -> Result<()> {
                 Some(action) => {
                     let section = split(&mut config, action)?;
                     config.save()?;
+                    if section == Section::Apps {
+                        apply_split_live(&config).await;
+                    }
                     Some(section)
                 }
                 None => None,
@@ -319,6 +321,36 @@ async fn run() -> Result<()> {
         Command::InstallDaemon { stage, owner_uid } => setup::install_as_root(&stage, owner_uid)?,
     }
     Ok(())
+}
+
+/// Hand an edited app list to a tunnel that is already up.
+///
+/// Split rules used to be read at connect only, so `split apps add` looked like
+/// it had done nothing until the tunnel was cycled, and a rule that had been
+/// removed kept the application going direct.  Not being connected, or a
+/// daemon that predates this command, is normal here: the list is applied when
+/// the tunnel comes up, which is what the line says.
+async fn apply_split_live(config: &Config) {
+    let applications = if config.split.apps_selective() {
+        Vec::new()
+    } else {
+        config.split.enabled_apps()
+    };
+    let note = match daemon().await {
+        Err(error) => format!("will apply on connect: {error}"),
+        Ok(mut client) => {
+            match client
+                .request(DaemonCommand::UpdateSplit(ApplicationsRequest {
+                    applications,
+                }))
+                .await
+            {
+                Ok(_) => "applied to the running tunnel".to_string(),
+                Err(error) => format!("will apply on connect: {error}"),
+            }
+        }
+    };
+    println!("{}", dim(&note));
 }
 
 /// Connect to the daemon, installing and starting it if this is the first time.
@@ -397,7 +429,12 @@ async fn connect(config: &mut Config, name: Option<&str>) -> Result<()> {
         "connecting to {}…",
         label(&server.label, config.settings.emoji)
     );
-    print_state(&daemon().await?.request(DaemonCommand::Connect(request)).await?);
+    print_state(
+        &daemon()
+            .await?
+            .request(DaemonCommand::Connect(request))
+            .await?,
+    );
     Ok(())
 }
 
@@ -495,9 +532,7 @@ async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
             for url in urls {
                 let result = fetch_subscription(url.clone(), config.settings.user_agent.clone())
                     .await
-                    .map_err(|error| {
-                        anyhow::anyhow!("updating {}: {error}", redacted_url(&url))
-                    })?;
+                    .map_err(|error| anyhow::anyhow!("updating {}: {error}", redacted_url(&url)))?;
                 let count = result.servers.len();
                 merge(config, result.servers, Some(&url));
                 if let Some(sub) = config.subscriptions.iter_mut().find(|s| s.url == url) {
@@ -575,7 +610,11 @@ fn print_settings(settings: &config::Settings) {
         ),
         ("emoji", on_off(settings.emoji).to_string(), "on | off"),
     ];
-    let name_width = rows.iter().map(|(name, _, _)| name.len()).max().unwrap_or(0);
+    let name_width = rows
+        .iter()
+        .map(|(name, _, _)| name.len())
+        .max()
+        .unwrap_or(0);
     let value_width = rows
         .iter()
         .map(|(_, value, _)| value.chars().count())
@@ -634,9 +673,18 @@ async fn ping(config: &Config, args: PingArgs, scope: Scope) -> Result<()> {
 
     let names: Vec<String> = indices
         .iter()
-        .map(|index| label(&config.locations[*index].server.label, config.settings.emoji))
+        .map(|index| {
+            label(
+                &config.locations[*index].server.label,
+                config.settings.emoji,
+            )
+        })
         .collect();
-    let width = names.iter().map(|name| name.chars().count()).max().unwrap_or(0);
+    let width = names
+        .iter()
+        .map(|name| name.chars().count())
+        .max()
+        .unwrap_or(0);
 
     // Probes are independent, and a sequential sweep of a whole subscription is
     // dominated by the timeouts of whichever locations are down. Proxy probes
@@ -713,9 +761,8 @@ fn ping_targets(config: &Config, target: &str, scope: Scope) -> Result<Vec<usize
     if let Ok(index) = config.find(target) {
         return Ok(vec![index]);
     }
-    subscription_locations(config, target).map_err(|_| {
-        anyhow::anyhow!("no location or subscription matches {target:?}; try `all`")
-    })
+    subscription_locations(config, target)
+        .map_err(|_| anyhow::anyhow!("no location or subscription matches {target:?}; try `all`"))
 }
 
 fn subscription_locations(config: &Config, target: &str) -> Result<Vec<usize>> {

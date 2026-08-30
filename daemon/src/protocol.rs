@@ -38,6 +38,11 @@ pub struct ConnectRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationsRequest {
+    pub applications: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TcpPingRequest {
     pub host: String,
     pub port: u16,
@@ -96,6 +101,11 @@ pub enum DaemonCommand {
     Status,
     Connect(ConnectRequest),
     Disconnect,
+    /// Re-resolve the per-app split rules against the running process tree.
+    ///
+    /// Split rules are otherwise only read at connect, so editing an exception
+    /// list while the tunnel is up did nothing until the next reconnect.
+    UpdateSplit(ApplicationsRequest),
     TcpPing(TcpPingRequest),
     ProxyPing(ProxyPingRequest),
     LogTail,
@@ -195,10 +205,28 @@ pub fn validate_request(request: &RequestEnvelope) -> Result<(), DaemonErrorCode
         DaemonCommand::Connect(connect) => validate_connect_request(connect)?,
         DaemonCommand::TcpPing(ping) => validate_tcp_ping_request(ping)?,
         DaemonCommand::ProxyPing(ping) => validate_proxy_ping_request(ping)?,
+        DaemonCommand::UpdateSplit(applications) => {
+            validate_applications(&applications.applications)?
+        }
         DaemonCommand::Status
         | DaemonCommand::Disconnect
         | DaemonCommand::LogTail
         | DaemonCommand::ClearLog => {}
+    }
+    Ok(())
+}
+
+/// An exception list is bounded the same way whether it arrives with a connect
+/// or is edited while the tunnel is already up.
+pub fn validate_applications(applications: &[String]) -> Result<(), DaemonErrorCode> {
+    if applications.len() > MAX_EXCLUDED_APPS
+        || applications.iter().any(|application| {
+            application.trim().is_empty()
+                || application.len() > MAX_APP_SELECTOR_BYTES
+                || application.contains('\0')
+        })
+    {
+        return Err(DaemonErrorCode::InvalidRequest);
     }
     Ok(())
 }

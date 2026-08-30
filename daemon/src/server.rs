@@ -119,6 +119,7 @@ impl CommandHandler for SnapshotHandler {
             DaemonCommand::Status => Ok(self.state.read().await.clone()),
             DaemonCommand::Connect(_)
             | DaemonCommand::Disconnect
+            | DaemonCommand::UpdateSplit(_)
             | DaemonCommand::TcpPing(_)
             | DaemonCommand::ProxyPing(_)
             | DaemonCommand::LogTail

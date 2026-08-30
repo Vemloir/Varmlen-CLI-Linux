@@ -909,6 +909,22 @@ impl SystemLifecycleBackend {
         Ok(())
     }
 
+    async fn apply_split(&mut self, applications: &[String]) -> Result<(), DaemonError> {
+        let mut split = SplitManager::new(SystemSplitBackend::new(self.owner_uid));
+        split
+            .apply(SplitPlan::new(self.owner_uid, applications.to_vec()))
+            .await
+            .map_err(|error| {
+                DaemonError::new(
+                    DaemonErrorCode::SplitUnavailable,
+                    format!("per-app split tunnelling is unavailable: {error}"),
+                )
+            })?;
+        self.split = Some(split);
+        self.split_apps = applications.to_vec();
+        Ok(())
+    }
+
     async fn remove_split(&mut self) -> Result<(), DaemonError> {
         let Some(mut split) = self.split.take() else {
             self.split_apps.clear();
@@ -986,6 +1002,31 @@ impl LifecycleBackend for SystemLifecycleBackend {
                 "hold block was not installed with the required drop policy",
             ))
         }
+    }
+
+    async fn update_split(&mut self, applications: Vec<String>) -> Result<bool, DaemonError> {
+        if applications.is_empty() {
+            self.remove_split().await?;
+            return Ok(false);
+        }
+        if let Some(split) = self.split.as_mut() {
+            let owner_uid = self.owner_uid;
+            let plan = SplitPlan::new(owner_uid, applications.clone());
+            if split.update_plan(plan).await.map_err(|error| {
+                DaemonError::new(
+                    DaemonErrorCode::SplitUnavailable,
+                    format!("per-app split tunnelling is unavailable: {error}"),
+                )
+            })? {
+                self.split_apps = applications;
+                return Ok(true);
+            }
+            // The split had already degraded to nothing live; build a fresh one
+            // rather than reporting success over a dead watcher.
+            self.remove_split().await?;
+        }
+        self.apply_split(&applications).await?;
+        Ok(true)
     }
 
     async fn stop_data_plane(&mut self, preserve_split: bool) -> Result<(), DaemonError> {
@@ -1066,21 +1107,7 @@ impl LifecycleBackend for SystemLifecycleBackend {
             self.remove_split().await?;
         }
         if !request.excluded_apps.is_empty() && self.split.is_none() {
-            let mut split = SplitManager::new(SystemSplitBackend::new(self.owner_uid));
-            split
-                .apply(SplitPlan::new(
-                    self.owner_uid,
-                    request.excluded_apps.clone(),
-                ))
-                .await
-                .map_err(|error| {
-                    DaemonError::new(
-                        DaemonErrorCode::SplitUnavailable,
-                        format!("per-app split tunnelling is unavailable: {error}"),
-                    )
-                })?;
-            self.split = Some(split);
-            self.split_apps = request.excluded_apps.clone();
+            self.apply_split(&request.excluded_apps).await?;
         }
 
         let mut dns = DnsGuard::new(SystemDnsBackend::new());
