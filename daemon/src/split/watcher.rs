@@ -222,11 +222,7 @@ fn run_permission_loop(
                     let target = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))
                         .unwrap_or_default();
                     let process_uid = real_uid(pid).unwrap_or(u32::MAX);
-                    let process = snapshot(pid).unwrap_or(ProcessSnapshot {
-                        comm: String::new(),
-                        executable: PathBuf::new(),
-                        argument_zero: String::new(),
-                    });
+                    let process = snapshot(pid).unwrap_or_else(|_| ProcessSnapshot::empty());
                     let is_match = process_uid == owner_uid
                         && selectors.iter().any(|selector| {
                             selector.matches_target(&target) || selector.matches(&process)
@@ -279,6 +275,8 @@ mod tests {
             comm: "cs2".into(),
             executable: PathBuf::from("/games/cs2"),
             argument_zero: "/games/cs2".into(),
+            arguments: vec!["/games/cs2".into()],
+            cgroup: "/user.slice/app.slice/app-cs2.scope".into(),
         }
     }
 
@@ -337,6 +335,8 @@ mod tests {
             comm: "steam".into(),
             executable: PathBuf::from("/usr/bin/steam"),
             argument_zero: "steam".into(),
+            arguments: vec!["steam".into()],
+            cgroup: "/user.slice/app.slice/app-steam.scope".into(),
         };
         assert_eq!(
             permission_decision(
