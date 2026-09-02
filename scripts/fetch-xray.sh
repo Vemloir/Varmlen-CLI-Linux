@@ -1,7 +1,7 @@
 #!/bin/sh
 # Fetch the pinned xray-core build the daemon runs.
 #
-# The daemon executes /usr/libexec/varmlen/xray; without it nothing connects.
+# The daemon executes /opt/varmlen-cli/xray; without it nothing connects.
 # It is fetched at package time rather than committed, and always checked
 # against the digest XTLS publishes beside the archive.
 #

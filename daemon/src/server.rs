@@ -9,8 +9,10 @@ use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration};
 
 use crate::protocol::{
-    decode_request_frame, encode_frame, operation_id_of_rejected_request, DaemonCommand,
-    DaemonError, DaemonErrorCode, DaemonState, ResponseEnvelope, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    daemon_version, decode_request_frame, encode_frame, operation_id_of_rejected_request,
+    DaemonCommand,
+    DaemonError, DaemonErrorCode, DaemonState, ResponseEnvelope, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION,
 };
 
 pub const MAX_CONCURRENT_CLIENTS: usize = 16;
@@ -177,6 +179,7 @@ pub async fn serve_connection_with_limits(
                         code,
                         message: "invalid daemon request".to_string(),
                     }),
+                    daemon_version: daemon_version(),
                 };
                 timeout(io_timeout, write_response(&mut stream, &response))
                     .await
@@ -198,6 +201,7 @@ pub async fn serve_connection_with_limits(
             version: PROTOCOL_VERSION,
             operation_id: operation,
             result,
+            daemon_version: daemon_version(),
         };
         timeout(io_timeout, write_response(&mut stream, &response))
             .await

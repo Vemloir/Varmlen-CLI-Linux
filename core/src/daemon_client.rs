@@ -38,6 +38,9 @@ impl From<DaemonError> for ClientError {
 pub struct DaemonClient {
     stream: UnixStream,
     next_operation_id: u64,
+    /// The version the daemon reported in its last response, empty when it is
+    /// too old to report one. See `varmlend::protocol::daemon_version`.
+    daemon_version: String,
 }
 
 impl DaemonClient {
@@ -53,6 +56,7 @@ impl DaemonClient {
                 .await
                 .map_err(|_| ClientError::Timeout("connecting"))??,
             next_operation_id: 1,
+            daemon_version: String::new(),
         })
     }
 
@@ -71,7 +75,7 @@ impl DaemonClient {
                 varmlend::protocol::DaemonErrorCode::UnsupportedVersion,
                 _,
             )) => Err(ClientError::RestartRequired(
-                "an outdated Varmlen background daemon is still running; reboot once before connecting this build"
+                "an outdated Varmlen background daemon is still running; update it with `varmlen-cli update`"
                     .into(),
             )),
             Err(error) => Err(error),
@@ -119,6 +123,14 @@ impl DaemonClient {
         ))
     }
 
+/// The version of the daemon this connection is talking to, taken from its
+    /// last response. Empty for a daemon that predates version reporting,
+    /// which is itself a finding: installing over curl left that daemon serving
+    /// a client newer than it.
+    pub fn daemon_version(&self) -> &str {
+        &self.daemon_version
+    }
+
     pub async fn request(&mut self, command: DaemonCommand) -> Result<DaemonState, ClientError> {
         let operation_id = self.next_operation_id;
         self.next_operation_id = self.next_operation_id.wrapping_add(1).max(1);
@@ -149,6 +161,10 @@ impl DaemonClient {
         .await
         .map_err(|_| ClientError::Timeout("reading a response"))??;
         let response = decode_response_frame(&response_bytes).map_err(ClientError::Protocol)?;
+        // Remember who answered, whoever that turns out to be: a refused
+        // request is still an answer from the same daemon, and its version is
+        // what the caller needs in order to explain the refusal.
+        self.daemon_version = response.daemon_version;
         if response.operation_id != operation_id {
             // A daemon that refuses a request while decoding it answers with the
             // id it could salvage, which for an older daemon is 0. Its error
@@ -196,6 +212,7 @@ mod tests {
                         rtt_ms: None,
                         log_tail: None,
                     }),
+                    daemon_version: "0.1.2".to_string(),
                 },
             )
             .await
@@ -205,12 +222,13 @@ mod tests {
         let mut client = DaemonClient::connect(&socket).await.unwrap();
         let state = client.request(DaemonCommand::Status).await.unwrap();
         assert_eq!(state.phase, ConnectionPhase::Disconnected);
+        assert_eq!(client.daemon_version(), "0.1.2");
         server.await.unwrap();
         let _ = std::fs::remove_file(socket);
     }
 
     #[tokio::test]
-    async fn compatibility_probe_requires_reboot_for_an_old_daemon() {
+    async fn compatibility_probe_points_an_old_daemon_at_an_update() {
         let socket = unique_socket_path();
         let listener = UnixListener::bind(&socket).unwrap();
         let server = tokio::spawn(async move {
@@ -228,6 +246,7 @@ mod tests {
                         varmlend::protocol::DaemonErrorCode::UnsupportedVersion,
                         "old daemon",
                     )),
+                    daemon_version: String::new(),
                 },
             )
             .await
@@ -236,7 +255,9 @@ mod tests {
 
         let error = DaemonClient::connect_compatible(&socket).await.unwrap_err();
         assert!(matches!(error, ClientError::RestartRequired(_)));
-        assert!(error.to_string().contains("reboot"));
+        // A reboot is not what is missing: the daemon binary has to be
+        // replaced and the service restarted, which the client can do.
+        assert!(error.to_string().contains("varmlen-cli update"));
         server.await.unwrap();
         let _ = std::fs::remove_file(socket);
     }

@@ -12,7 +12,9 @@
 #
 # The daemon has to run as root, so those staged files are moved into
 # /opt/varmlen-cli the first time a command needs it — varmlen-cli asks for
-# sudo at that point, and not before.
+# sudo at that point, and not before. A daemon already running from an earlier
+# install is replaced too, because installing a client does not install its
+# daemon: the running process keeps the files it started with.
 #
 # Environment:
 #   VARMLEN_VERSION   install a specific tag (default: the latest release)
@@ -72,6 +74,21 @@ echo "Checksum verified."
 tar -C "$TMP" -xzf "$TMP/$NAME.tar.gz"
 
 sh "$TMP/$NAME/install.sh"
+
+# A daemon that is up keeps answering from the files it started with, so the
+# fresh client on disk says nothing about the code actually serving requests;
+# the skew surfaces later as a command the old daemon has never heard of. If
+# one is answering, let the client judge it: `varmlen-cli update` compares the
+# version the daemon reports with its own, and reaches for sudo only when there
+# is really something to replace. The socket is probed by name rather than with
+# `varmlen-cli status` because that command would install a missing daemon, and
+# an installer should not ask for a password to find out nothing is running.
+BIN=${XDG_BIN_HOME:-$HOME/.local/bin}/varmlen-cli
+if [ -x "$BIN" ] && [ -S "/run/varmlen/daemon-$(id -u).sock" ]; then
+    echo
+    "$BIN" update ||
+        echo "Run \"$BIN update --yes\" to replace the daemon; that brings the tunnel down."
+fi
 
 cat <<'NEXT'
 

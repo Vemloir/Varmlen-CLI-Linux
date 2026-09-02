@@ -190,11 +190,27 @@ impl DaemonError {
     }
 }
 
+/// The version of the running daemon, carried by every response.
+///
+/// The framing version above says only that the wire format matches, which the
+/// client had to establish to get an answer at all. What it cannot say is
+/// whether this is the daemon that shipped with the client: installing over
+/// curl replaces the client binary while the previously installed daemon keeps
+/// serving, so every request then quietly goes to older code -- the reason a
+/// live split edit comes back as `invalid daemon request` after an upgrade.
+pub fn daemon_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
     pub version: u16,
     pub operation_id: u64,
     pub result: Result<DaemonState, DaemonError>,
+    /// Empty when the daemon predates version reporting, which is itself the
+    /// answer: that daemon is older than anything that knows to ask.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub daemon_version: String,
 }
 
 pub fn validate_request(request: &RequestEnvelope) -> Result<(), DaemonErrorCode> {
@@ -335,10 +351,11 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        decode_response_frame, operation_id_of_rejected_request, validate_connect_request,
-        validate_proxy_ping_request, validate_tcp_ping_request, ConnectRequest, ConnectionMode,
-        ConnectionPhase, DaemonCommand, DaemonErrorCode, ProxyPingRequest, RequestEnvelope,
-        TcpPingRequest, MAX_PING_TIMEOUT_MS, PROTOCOL_VERSION,
+        daemon_version, decode_response_frame, encode_frame, operation_id_of_rejected_request,
+        validate_connect_request, validate_proxy_ping_request, validate_tcp_ping_request,
+        ConnectRequest, ConnectionMode, ConnectionPhase, DaemonCommand, DaemonError,
+        DaemonErrorCode, ProxyPingRequest, RequestEnvelope, ResponseEnvelope, TcpPingRequest,
+        MAX_PING_TIMEOUT_MS, PROTOCOL_VERSION,
     };
 
     #[test]
@@ -468,5 +485,23 @@ mod tests {
         let state = decoded.result.unwrap();
         assert_eq!(state.phase, ConnectionPhase::Connected);
         assert_eq!(state.rtt_ms, None);
+        // A daemon that never heard of versions reports none, rather than the
+        // version of whatever is reading it -- that silence is the diagnosis.
+        assert_eq!(decoded.daemon_version, "");
+    }
+
+    #[test]
+    fn a_response_names_the_daemon_that_produced_it() {
+        // Installing over curl leaves the previously installed daemon answering
+        // a newer client, so only the daemon can say which one is answering.
+        let response = ResponseEnvelope {
+            version: PROTOCOL_VERSION,
+            operation_id: 1,
+            result: Err(DaemonError::new(DaemonErrorCode::InvalidRequest, "refused")),
+            daemon_version: daemon_version(),
+        };
+        let decoded = decode_response_frame(&encode_frame(&response).unwrap()).unwrap();
+        assert_eq!(decoded.daemon_version, daemon_version());
+        assert_ne!(decoded.daemon_version, "");
     }
 }

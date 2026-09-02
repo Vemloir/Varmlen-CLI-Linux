@@ -32,8 +32,8 @@ use varmlen_core::xray::{
     build_connection_probe_config, build_ping_config, generate_xray_config, ping_placeholder_ports,
 };
 use varmlend::protocol::{
-    ApplicationsRequest, ConnectRequest, ConnectionMode, DaemonCommand, DaemonErrorCode,
-    DaemonState, ProxyPingRequest, TcpPingRequest,
+    ApplicationsRequest, ConnectRequest, ConnectionMode, ConnectionPhase, DaemonCommand,
+    DaemonErrorCode, DaemonState, ProxyPingRequest, TcpPingRequest,
 };
 
 use config::{location_key, Config, Location, Subscription};
@@ -58,6 +58,18 @@ enum Command {
     Connect(ConnectArgs),
     /// Tear the tunnel down.
     Disconnect,
+    /// Replace a running daemon with the one that shipped with this client.
+    ///
+    /// Installing over curl replaces the client binary only: a daemon already
+    /// running keeps answering from the files it started with, and the two then
+    /// disagree in ways that look like broken features. Restarting drops the
+    /// tunnel, so a connected tunnel has to come down first or the update has
+    /// to be confirmed with --yes.
+    Update {
+        /// Restart the daemon even while the tunnel is up.
+        #[arg(long)]
+        yes: bool,
+    },
     /// List configured locations.
     List,
     /// Add a location from a vless:// / vmess:// / trojan:// / ss:// URI.
@@ -99,6 +111,9 @@ enum Command {
         stage: std::path::PathBuf,
         #[arg(long)]
         owner_uid: u32,
+        /// Restart the service after installing, to replace a running daemon.
+        #[arg(long)]
+        restart: bool,
     },
 }
 
@@ -253,7 +268,12 @@ async fn run() -> Result<()> {
     let mut config = Config::load().context("reading the CLI config")?;
 
     match cli.command {
-        Command::Status => print_state(&daemon().await?.request(DaemonCommand::Status).await?),
+        Command::Status => {
+            let mut client = daemon().await?;
+            let state = client.request(DaemonCommand::Status).await?;
+            print_state(&state);
+            print_version_hint(client.daemon_version());
+        }
         Command::Connect(args) => {
             let name = args.name.join(" ");
             let name = name.trim();
@@ -262,6 +282,7 @@ async fn run() -> Result<()> {
         Command::Disconnect => {
             print_state(&daemon().await?.request(DaemonCommand::Disconnect).await?)
         }
+        Command::Update { yes } => update(yes).await?,
         Command::List => list(&config),
         Command::Add { uri } => {
             let server = parse_proxy_uri(&uri).map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -318,7 +339,11 @@ async fn run() -> Result<()> {
             print_split(&config.split, section);
         }
         Command::ConfigPath => println!("{}", config::config_path().display()),
-        Command::InstallDaemon { stage, owner_uid } => setup::install_as_root(&stage, owner_uid)?,
+        Command::InstallDaemon {
+            stage,
+            owner_uid,
+            restart,
+        } => setup::install_as_root(&stage, owner_uid, restart)?,
     }
     Ok(())
 }
@@ -353,6 +378,66 @@ async fn apply_split_live(config: &Config) {
     println!("{}", dim(&note));
 }
 
+/// Replace a daemon that is older than this client.
+///
+/// Client and daemon ship from one tree, but installing replaces the client
+/// alone: a daemon that was already running keeps answering from the files it
+/// started from, and nothing about a working `status` says it is stale. The
+/// difference surfaces as a command the daemon refuses to understand.
+async fn update(yes: bool) -> Result<()> {
+    let mut client = daemon().await?;
+    let state = client.request(DaemonCommand::Status).await?;
+    let running = client.daemon_version().to_string();
+    // The version of the daemon this client was built alongside, not the
+    // client's own: the two are released together but are separately versioned
+    // crates, and it is the daemon being replaced here.
+    let shipped = varmlend::protocol::daemon_version();
+    if running == shipped {
+        println!("The daemon is already {shipped}.");
+        return Ok(());
+    }
+    println!(
+        "{}",
+        if running.is_empty() {
+            format!("The running daemon predates version reporting; this client ships {shipped}.")
+        } else {
+            format!("The running daemon is {running}; this client ships {shipped}.")
+        }
+    );
+    if state.phase == ConnectionPhase::Connected && !yes {
+        bail!("replacing the daemon brings the tunnel down; disconnect first, or re-run with --yes");
+    }
+
+    let socket = DaemonClient::installed_socket_path();
+    tokio::task::spawn_blocking(move || {
+        setup::elevate_and_install(
+            || std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+            setup::Install::Outdated,
+        )
+    })
+    .await??;
+    println!("Daemon replaced with {shipped}.");
+    if state.phase == ConnectionPhase::Connected {
+        println!("The tunnel went down with the old daemon: varmlen-cli connect");
+    }
+    Ok(())
+}
+
+/// Say so when the daemon answering is not the daemon this client was built
+/// with, rather than leaving the user to discover it from a refused command.
+fn print_version_hint(daemon_version: &str) {
+    let shipped = varmlend::protocol::daemon_version();
+    if daemon_version == shipped {
+        return;
+    }
+    let stale = if daemon_version.is_empty() {
+        "daemon reports no version, so it predates this client — run: varmlen-cli update".to_string()
+    } else {
+        format!("daemon {daemon_version}, client {shipped} — run: varmlen-cli update")
+    };
+    println!("{}", dim(&stale));
+}
+
 /// Connect to the daemon, installing and starting it if this is the first time.
 ///
 /// Installation is deferred to here rather than done by the installer so that
@@ -364,8 +449,16 @@ async fn daemon() -> Result<DaemonClient> {
     }
 
     let socket = DaemonClient::installed_socket_path();
+    let reason = if setup::installed() {
+        setup::Install::Stopped
+    } else {
+        setup::Install::Missing
+    };
     tokio::task::spawn_blocking(move || {
-        setup::elevate_and_install(|| std::os::unix::net::UnixStream::connect(&socket).is_ok())
+        setup::elevate_and_install(
+            || std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+            reason,
+        )
     })
     .await??;
 

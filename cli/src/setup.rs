@@ -33,7 +33,7 @@ pub fn stage_dir() -> PathBuf {
 }
 
 /// Whether the daemon is already on the system. Says nothing about it running.
-fn installed() -> bool {
+pub fn installed() -> bool {
     COMPONENTS
         .iter()
         .all(|name| Path::new(SYSTEM_DIR).join(name).is_file())
@@ -45,7 +45,19 @@ fn installed() -> bool {
 /// Runs `sudo` against this same binary rather than shipping a separate
 /// privileged helper: there is then only one artefact to trust, and what root
 /// runs is the executable the user already invoked.
-pub fn elevate_and_install(socket_ready: impl Fn() -> bool) -> Result<()> {
+/// Why root is being asked for, since the three cases read very differently to
+/// the user even though they end in the same privileged install.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Install {
+    /// Nothing is installed yet.
+    Missing,
+    /// Installed, but not answering.
+    Stopped,
+    /// Answering, but not with the code that shipped with this client.
+    Outdated,
+}
+
+pub fn elevate_and_install(socket_ready: impl Fn() -> bool, reason: Install) -> Result<()> {
     let stage = stage_dir();
     for name in COMPONENTS {
         if !stage.join(name).is_file() {
@@ -61,20 +73,26 @@ pub fn elevate_and_install(socket_ready: impl Fn() -> bool) -> Result<()> {
     let uid = unsafe { libc::getuid() };
 
     // Reinstalling is harmless and re-enables the unit, so the same path
-    // handles a daemon that was never installed and one that is simply not
-    // running. Only the explanation differs.
+    // handles a daemon that was never installed, one that is simply not
+    // running, and one that is older than this client. Only the explanation
+    // and whether the service is restarted differ.
     eprintln!(
         "{}",
-        if installed() {
-            "The Varmlen daemon is installed but not running. Starting it needs sudo:"
-        } else {
-            "The Varmlen daemon is not installed yet. It runs as root, so this needs sudo:"
+        match reason {
+            Install::Missing =>
+                "The Varmlen daemon is not installed yet. It runs as root, so this needs sudo:",
+            Install::Stopped =>
+                "The Varmlen daemon is installed but not running. Starting it needs sudo:",
+            Install::Outdated =>
+                "A Varmlen daemon older than this client is running. Replacing it needs sudo:",
         }
     );
+    let restart = matches!(reason, Install::Outdated);
     eprintln!(
-        "  sudo {} __install-daemon --stage {} --owner-uid {uid}",
+        "  sudo {} __install-daemon --stage {} --owner-uid {uid}{}",
         executable.display(),
-        stage.display()
+        stage.display(),
+        if restart { " --restart" } else { "" }
     );
 
     let status = Command::new("sudo")
@@ -84,6 +102,7 @@ pub fn elevate_and_install(socket_ready: impl Fn() -> bool) -> Result<()> {
         .arg(&stage)
         .arg("--owner-uid")
         .arg(uid.to_string())
+        .args(if restart { ["--restart"].as_slice() } else { &[] })
         .status()
         .context("running sudo — install it, or run this command as root")?;
     if !status.success() {
@@ -104,7 +123,7 @@ pub fn elevate_and_install(socket_ready: impl Fn() -> bool) -> Result<()> {
 
 /// The privileged half. Only ever invoked by `elevate_and_install` through
 /// sudo, which is why it is hidden from the command list.
-pub fn install_as_root(stage: &Path, owner_uid: u32) -> Result<()> {
+pub fn install_as_root(stage: &Path, owner_uid: u32, restart: bool) -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("__install-daemon must run as root");
     }
@@ -137,15 +156,23 @@ pub fn install_as_root(stage: &Path, owner_uid: u32) -> Result<()> {
     set_mode(Path::new(UNIT_PATH), 0o644)?;
 
     run("systemctl", &["daemon-reload".into()])?;
-    run(
-        "systemctl",
-        &[
-            "enable".into(),
-            "--now".into(),
-            format!("varmlen-cli@{owner_uid}"),
-        ],
-    )?;
+    let unit = format!("varmlen-cli@{owner_uid}");
+    run("systemctl", &["enable".into(), unit.clone()])?;
+    // Replacing the files does not disturb the running daemon — it keeps the
+    // inode it started from — so an update is not one until the service is
+    // restarted. That brings the tunnel down with it, which is why only an
+    // explicit update asks for it.
+    if restart || !unit_active(&unit) {
+        run("systemctl", &["restart".into(), unit])?;
+    }
     Ok(())
+}
+
+fn unit_active(unit: &str) -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", unit])
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn set_owner_root(path: &Path) -> Result<()> {

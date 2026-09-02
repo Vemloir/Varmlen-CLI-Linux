@@ -38,7 +38,15 @@ systemd unit `varmlen-cli@<uid>`.
 
 The installer verifies the release archive against the SHA-256 checksums
 published with it before unpacking anything, and refuses to continue on a
-mismatch. `VARMLEN_VERSION=v0.1.1` pins a specific release.
+mismatch. `VARMLEN_VERSION=v0.1.2` pins a specific release.
+
+Reinstalling updates the client; a daemon that is already running keeps
+answering from the files it started with, which is how an upgrade ends up
+looking like a broken feature — the old daemon simply has no idea about a newer
+command. The installer notices a daemon that is answering and runs
+`varmlen-cli update`, which replaces it and restarts the unit: that asks for
+`sudo`, and brings the tunnel down while it is at it. `varmlen-cli status` says
+when client and daemon are out of step.
 
 Requirements: Linux with systemd. The binaries are statically linked, so there
 is no minimum glibc and no distribution-specific packaging — a build from any
