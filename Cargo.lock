@@ -1310,7 +1310,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "varmlen-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "varmlen-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "futures-util",
@@ -1342,7 +1342,7 @@ dependencies = [
 
 [[package]]
 name = "varmlen-net"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "caps",
  "libc",
@@ -1351,7 +1351,7 @@ dependencies = [
 
 [[package]]
 name = "varmlend"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "async-trait",
  "futures-util",

@@ -2,10 +2,10 @@
 # Install the Varmlen CLI. Needs no privileges.
 #
 # The client goes on PATH; the daemon, its helper and xray are staged in the
-# user's data directory. They are moved into /usr/libexec/varmlen as root the
-# first time a command actually needs the daemon — see cli/src/setup.rs. The
-# daemon cannot run unprivileged, but getting the client should not require
-# deciding to trust an installer with root.
+# user's data directory. They are moved into /opt/varmlen-cli as root the first
+# time a command actually needs the daemon — see cli/src/setup.rs. The daemon
+# cannot run unprivileged, but getting the client should not require deciding to
+# trust an installer with root.
 #
 # Works from a source checkout (after scripts/build-release.sh, with xray
 # fetched by scripts/fetch-xray.sh) and from an extracted release tarball.

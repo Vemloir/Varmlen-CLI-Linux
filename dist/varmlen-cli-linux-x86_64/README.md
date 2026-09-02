@@ -25,20 +25,39 @@ serve it. Measured on one machine: **~345 MB of resident memory**.
 
 ```sh
 curl -fsSL https://aegisvpn.org/varmlen-cli-linux/install.sh | sh
-sudo systemctl enable --now varmlend@$(id -u)
 ```
+
+Nothing here needs privileges. The client goes to `~/.local/bin`, and the
+daemon, its helper and `xray` are staged in `~/.local/share/varmlen/stage`.
+
+The first command that needs the daemon installs it, and that step asks for
+`sudo` once — the daemon manages routes, routing rules, nftables chains and BPF
+programs, so it cannot run unprivileged, and it refuses to execute components
+that are not root-owned. It is installed to `/opt/varmlen-cli` and run by the
+systemd unit `varmlen-cli@<uid>`.
 
 The installer verifies the release archive against the SHA-256 checksums
 published with it before unpacking anything, and refuses to continue on a
-mismatch. `VARMLEN_VERSION=v0.1.0` pins a specific release. x86_64 and aarch64
-are built; systemd is required.
+mismatch. `VARMLEN_VERSION=v0.1.2` pins a specific release.
+
+Reinstalling updates the client; a daemon that is already running keeps
+answering from the files it started with, which is how an upgrade ends up
+looking like a broken feature — the old daemon simply has no idea about a newer
+command. The installer notices a daemon that is answering and runs
+`varmlen-cli update`, which replaces it and restarts the unit: that asks for
+`sudo`, and brings the tunnel down while it is at it. `varmlen-cli status` says
+when client and daemon are out of step.
+
+Requirements: Linux with systemd. The binaries are statically linked, so there
+is no minimum glibc and no distribution-specific packaging — a build from any
+machine runs on any other.
 
 ### From source
 
 ```sh
-./scripts/build-release.sh
-sudo ./packaging/install.sh
-sudo systemctl enable --now varmlend@$(id -u)
+./scripts/build-release.sh                                    # static musl
+./scripts/fetch-xray.sh target/x86_64-unknown-linux-musl/release
+./packaging/install.sh
 ```
 
 ## Use
@@ -114,15 +133,24 @@ A bare name resolves to a location before a subscription, since numbers and
 location names are what `list` shows; `ping sub <n>` says which was meant when
 both would match.
 
+A UDP transport pays a QUIC handshake before a probe answers, so Hysteria2,
+WireGuard, mKCP and QUIC locations get 15 s instead of the 5 s a TCP location
+needs — judging them on 5 s reports live nodes as dead. `--timeout` overrides
+that. `--tcp` falls back to the proxy probe on those locations rather than
+measuring a TCP listener that cannot exist.
+
 Probes run concurrently, so a sweep costs about as long as its slowest member
 rather than the sum of every timeout. Results print in `list` order, so the
 number beside one is the number to hand to `connect`.
 
 The default probe goes through the proxy — the daemon starts a throwaway xray
 on ports it reserves itself and times a real request, so the figure includes the
-TLS handshake and the proxy's own latency. `--tcp` times only the handshake to
-the endpoint, which says whether the host answers but nothing about the tunnel.
-Neither touches the current connection.
+TLS handshake and the proxy's own latency. When the profile names a
+DNS-over-HTTPS resolver the same probe also asks that resolver a name through
+the same path, because a location that carries traffic but cannot reach its own
+resolver is not healthy; a refusal to answer is reported as the reason. `--tcp`
+times only the handshake to the endpoint, which says whether the host answers
+but nothing about the tunnel. Neither touches the current connection.
 
 Configuration lives in `~/.config/varmlen/cli.json` (`varmlen-cli config-path`).
 It holds proxy credentials, so it is written `0600` in a `0700` directory.
@@ -143,6 +171,11 @@ them.
 
 ## Notes
 
+**Root is asked for late, not early.** Installing needs nothing; the daemon
+needs everything. Deferring the privileged step to the first command that
+actually uses the daemon means nobody has to hand root to an installer just to
+try the client.
+
 **The daemon does not start itself.** The desktop client launches it through
 `pkexec`, which needs a polkit authentication agent bound to a graphical
 session. A headless system has none, so the daemon runs under systemd instead
@@ -150,10 +183,23 @@ and takes the desktop owner's uid as `--owner-uid`. That value was never a trust
 token — the daemon is not linked against polkit and performs no authorization
 with it; it only tells the daemon whose socket to create.
 
-**One daemon at a time.** `varmlend` holds an exclusive lock on
-`/run/varmlen/daemon.lock`. Running the systemd unit while the desktop client's
-own daemon is up will fail with `another Varmlen daemon already owns the
-network`. Use one or the other.
+**It does not share a directory with the desktop package.** That package owns
+`/usr/libexec/varmlen`; this installs to `/opt/varmlen-cli` under its own unit
+name, and the daemon resolves its helper and core next to whichever copy of
+itself is running. Two installations can coexist without overwriting each
+other's files.
+
+**One daemon at a time, even so.** `varmlend` holds an exclusive lock on
+`/run/varmlen/daemon.lock`, because only one process can own the machine's
+routing. Starting this unit while the desktop client's own daemon is up fails
+with `another Varmlen daemon already owns the network`. Coexisting on disk is
+not the same as running together — use one or the other.
+
+**xray is bundled.** The daemon executes it as a child process; without it
+nothing connects. It is fetched at package time by `scripts/fetch-xray.sh` and
+checked against the digest XTLS publishes with the release, never committed.
+xray-core is MPL-2.0 and never linked into anything here, so it ships as mere
+aggregation, with its own licence beside it as `LICENSE.xray`.
 
 **Stopping is not the same as killing.** The daemon disconnects on `SIGTERM`, so
 `systemctl stop` removes the tunnel's routes, rules and nftables state before
@@ -163,9 +209,16 @@ startup cleanup is what repairs that state.
 
 ## Build hygiene
 
-`scripts/build-release.sh` remaps `$CARGO_HOME` and `$RUSTUP_HOME` out of the
-binaries and then asserts they are gone, failing the build rather than shipping
-one that names the machine it was built on. The release profile strips symbols.
+`scripts/build-release.sh` builds statically against musl, remaps `$CARGO_HOME`
+and `$RUSTUP_HOME` out of the binaries, and then asserts both properties —
+failing the build rather than shipping one that names the machine it was built
+on or refuses to start on an older distribution. The release profile strips
+symbols.
+
+musl rather than glibc because a glibc binary will not start on any system
+whose glibc is older than the one it was built against: built on Ubuntu 26.04 it
+requires `GLIBC_2.39`, which rules out Debian 12, RHEL 9 and Alpine. Static
+linking removes the question rather than managing it.
 
 Without this, Rust embeds the absolute path of every dependency source file
 (via `file!()` in panic machinery) into the binary, shipping the build user's
