@@ -36,7 +36,7 @@ use varmlend::protocol::{
     DaemonErrorCode, DaemonState, ProxyPingRequest, TcpPingRequest,
 };
 
-use config::{location_key, Config, Location, Subscription};
+use config::{Config, MergeOutcome, Subscription};
 use display::{bold, bytes, date, dim, label, redacted_url};
 
 #[derive(Parser)]
@@ -287,9 +287,9 @@ async fn run() -> Result<()> {
         Command::Add { uri } => {
             let server = parse_proxy_uri(&uri).map_err(|error| anyhow::anyhow!("{error}"))?;
             let label = server.label.clone();
-            merge(&mut config, vec![server], None);
+            let outcome = config.merge(vec![server], None).remove(0);
             config.save()?;
-            println!("added {}", display::label(&label, config.settings.emoji));
+            report_add(&config, &label, outcome);
         }
         Command::Remove { name } => {
             let index = config
@@ -575,7 +575,7 @@ async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
                 .await
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
             let count = result.servers.len();
-            merge(config, result.servers, Some(&url));
+            config.merge(result.servers, Some(&url));
             config.subscriptions.push(Subscription {
                 url,
                 meta: result.meta,
@@ -627,7 +627,7 @@ async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
                     .await
                     .map_err(|error| anyhow::anyhow!("updating {}: {error}", redacted_url(&url)))?;
                 let count = result.servers.len();
-                merge(config, result.servers, Some(&url));
+                config.merge(result.servers, Some(&url));
                 if let Some(sub) = config.subscriptions.iter_mut().find(|s| s.url == url) {
                     sub.meta = result.meta;
                     sub.description = result.description;
@@ -1046,28 +1046,47 @@ fn print_split(split: &SplitInput, only: Option<Section>) {
     }
 }
 
-/// Refresh locations that came back with the same identity, add the rest.
-///
-/// Keyed on `location_key` rather than the display name: providers reuse names
-/// across locations, and matching on one would collapse distinct servers into
-/// a single entry.
-fn merge(config: &mut Config, incoming: Vec<VlessServer>, source: Option<&str>) {
-    for server in incoming {
-        let key = location_key(&server);
-        match config
-            .locations
-            .iter_mut()
-            .find(|existing| location_key(&existing.server) == key)
-        {
-            Some(existing) => {
-                existing.server = server;
-                existing.source = source.map(str::to_string);
-            }
-            None => config.locations.push(Location {
-                server,
-                source: source.map(str::to_string),
-            }),
+/// Tell the user what `add` did, because more than one thing is possible and
+/// only one of them is called "added".
+fn report_add(config: &Config, label: &str, outcome: MergeOutcome) {
+    let shown = display::label(label, config.settings.emoji);
+    match outcome {
+        MergeOutcome::Added => println!("added {shown}"),
+        MergeOutcome::Replaced => println!("updated {shown}"),
+        MergeOutcome::Kept {
+            subscription: Some(url),
+            provider_payload,
+        } => {
+            let owner = config
+                .subscriptions
+                .iter()
+                .find(|sub| sub.url == url)
+                .map(Subscription::display_name)
+                .unwrap_or_else(|| redacted_url(&url));
+            let kept = if provider_payload {
+                "kept its provider profile and its place in the subscription"
+            } else {
+                "kept as the subscription's own location"
+            };
+            println!(
+                "{shown} already comes from {owner} -- {kept}.\n  \
+                 Refresh it with `varmlen-cli sub update`"
+            );
         }
+        MergeOutcome::Kept {
+            subscription: None,
+            provider_payload: true,
+        } => println!(
+            "{shown} already holds the provider's own JSON -- kept it.\n  \
+             Remove it first to replace it with this link"
+        ),
+        MergeOutcome::Kept {
+            subscription: None,
+            provider_payload: false,
+        } => println!(
+            "{shown} is already configured -- kept it.\n  \
+             Remove it first to replace it with this link"
+        ),
     }
 }
 

@@ -63,6 +63,33 @@ pub struct Location {
     pub source: Option<String>,
 }
 
+impl Location {
+    /// Whether this holds the provider's own payload rather than one parsed URI:
+    /// the JSON profile (with its fallback outbounds, balancer and profile DNS),
+    /// the extracted outbound, or the source the editor shows under `JSON`.
+    fn carries_provider_payload(&self) -> bool {
+        self.server.raw_profile.is_some()
+            || self.server.raw_outbound.is_some()
+            || self.server.source_json.is_some()
+    }
+}
+
+/// What `Config::merge` did with one incoming location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// Nothing had this identity.
+    Added,
+    /// The stored location was replaced by the incoming one.
+    Replaced,
+    /// The stored location was left untouched because the incoming bare link
+    /// can only take away from it. `subscription` is its `source`, and
+    /// `provider_payload` says whether it carries the provider's own JSON.
+    Kept {
+        subscription: Option<String>,
+        provider_payload: bool,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
     pub url: String,
@@ -316,6 +343,62 @@ impl Config {
             },
         }
     }
+
+    /// Refresh locations that came back with the same identity, add the rest.
+    ///
+    /// Keyed on `location_key` rather than the display name: providers reuse
+    /// names across locations, and matching on one would collapse distinct
+    /// servers into a single entry.
+    ///
+    /// A bare link never replaces a location that carries more than a link.
+    /// `add` parses a single URI: it has no provider profile, no fallback
+    /// outbounds, no profile DNS, and no subscription of its own. Copying it
+    /// over a subscription location used to delete all of that -- including the
+    /// `source` that ties the location to its subscription, so no later
+    /// `sub update` could bring the profile back -- while reporting a plain
+    /// "added". The link states nothing the profile does not already state, so
+    /// the location is kept and the caller says so.
+    ///
+    /// An incoming location that does carry a `source` is the provider's own
+    /// payload for that identity and replaces what was stored: being current is
+    /// the whole point of `sub update`.
+    pub fn merge(
+        &mut self,
+        incoming: Vec<VlessServer>,
+        source: Option<&str>,
+    ) -> Vec<MergeOutcome> {
+        let mut outcomes = Vec::with_capacity(incoming.len());
+        for server in incoming {
+            let key = location_key(&server);
+            let stored = self
+                .locations
+                .iter()
+                .position(|existing| location_key(&existing.server) == key);
+            let Some(index) = stored else {
+                self.locations.push(Location {
+                    server,
+                    source: source.map(str::to_string),
+                });
+                outcomes.push(MergeOutcome::Added);
+                continue;
+            };
+            let existing = &self.locations[index];
+            if source.is_none()
+                && (existing.carries_provider_payload() || existing.source.is_some())
+            {
+                outcomes.push(MergeOutcome::Kept {
+                    subscription: existing.source.clone(),
+                    provider_payload: existing.carries_provider_payload(),
+                });
+                continue;
+            }
+            let existing = &mut self.locations[index];
+            existing.server = server;
+            existing.source = source.map(str::to_string);
+            outcomes.push(MergeOutcome::Replaced);
+        }
+        outcomes
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +456,150 @@ mod tests {
         assert_eq!(config.find("germany"), Ok(1));
         // Substring still reaches the part after the separator.
         assert_eq!(config.find("Helsinki"), Ok(0));
+    }
+
+    /// The same endpoint as a JSON subscription serves it: profile, extracted
+    /// outbound and the source text the editor shows as `JSON`.
+    fn provider_location(label: &str, host: &str, port: u16) -> VlessServer {
+        let mut server = server(label, host, port);
+        server.raw_outbound = Some(serde_json::json!({
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": { "vnext": [{ "address": host, "port": port }] }
+        }));
+        server.raw_profile = Some(serde_json::json!({
+            "remarks": label,
+            "outbounds": [
+                { "tag": "proxy", "protocol": "vless" },
+                { "tag": "proxy-2", "protocol": "vless" }
+            ],
+            "routing": { "balancers": [{ "tag": "balancer" }] }
+        }));
+        server.source_json = Some("{\"remarks\":\"provider\"}".to_string());
+        server
+    }
+
+    fn from_subscription(url: &str) -> Vec<Subscription> {
+        vec![Subscription {
+            url: url.to_string(),
+            meta: Default::default(),
+            description: None,
+        }]
+    }
+
+    /// The regression: pasting one share link for a location that came from a
+    /// JSON subscription replaced it with the bare link. The profile (fallback
+    /// outbounds, balancer, profile DNS), the `JSON` marker and the `source` all
+    /// went, and because `source` went, no later `sub update` could restore the
+    /// profile -- the location had quietly become a manually added URI.
+    #[test]
+    fn a_bare_link_never_buries_a_subscription_profile() {
+        const SUB: &str = "https://provider.example/sub/TOKEN";
+        let mut config = Config {
+            locations: vec![Location {
+                server: provider_location("\u{1F1EA}\u{1F1F8} Germany", "de.example", 443),
+                source: Some(SUB.to_string()),
+            }],
+            subscriptions: from_subscription(SUB),
+            ..Config::default()
+        };
+
+        let outcomes = config.merge(
+            vec![server("\u{1F1EA}\u{1F1F8} Germany", "de.example", 443)],
+            None,
+        );
+
+        assert_eq!(
+            outcomes,
+            vec![MergeOutcome::Kept {
+                subscription: Some(SUB.to_string()),
+                provider_payload: true,
+            }]
+        );
+        assert_eq!(config.locations.len(), 1, "the link must not append a twin");
+        let kept = &config.locations[0];
+        assert!(kept.server.raw_profile.is_some(), "the provider profile survived");
+        assert!(kept.server.raw_outbound.is_some(), "the exact outbound survived");
+        assert!(kept.server.source_json.is_some(), "the JSON source survived");
+        assert_eq!(kept.source.as_deref(), Some(SUB), "still a subscription member");
+    }
+
+    /// A subscription location without a profile is still not the user's manual
+    /// property: overwriting it unfiles it, and it never files itself back.
+    #[test]
+    fn a_bare_link_does_not_unfile_a_subscription_location() {
+        const SUB: &str = "https://provider.example/sub/TOKEN";
+        let mut config = Config {
+            locations: vec![Location {
+                server: server("Netherlands", "nl.example", 8443),
+                source: Some(SUB.to_string()),
+            }],
+            subscriptions: from_subscription(SUB),
+            ..Config::default()
+        };
+
+        let mut pasted = server("Netherlands", "nl.example", 8443);
+        pasted.uuid = "22222222-2222-2222-2222-222222222222".to_string();
+        let outcomes = config.merge(vec![pasted], None);
+
+        assert_eq!(
+            outcomes,
+            vec![MergeOutcome::Kept {
+                subscription: Some(SUB.to_string()),
+                provider_payload: false,
+            }]
+        );
+        assert_eq!(
+            config.locations[0].server.uuid,
+            "11111111-1111-1111-1111-111111111111",
+            "the pasted link did not reach the stored location"
+        );
+    }
+
+    /// The other half: `sub update` carries a source, and being current is the
+    /// point of it, so the provider's payload keeps replacing what is stored.
+    #[test]
+    fn a_subscription_fetch_still_replaces_what_it_returns() {
+        const OLD: &str = "https://provider.example/sub/OLD";
+        const NEW: &str = "https://provider.example/sub/NEW";
+        let mut config = Config {
+            locations: vec![Location {
+                server: provider_location("Estonia", "ee.example", 443),
+                source: Some(OLD.to_string()),
+            }],
+            subscriptions: from_subscription(OLD),
+            ..Config::default()
+        };
+
+        let outcomes = config.merge(vec![server("Estonia", "ee.example", 443)], Some(NEW));
+
+        assert_eq!(outcomes, vec![MergeOutcome::Replaced]);
+        let updated = &config.locations[0];
+        assert!(updated.server.raw_profile.is_none(), "the provider no longer ships a profile");
+        assert_eq!(updated.source.as_deref(), Some(NEW));
+    }
+
+    /// Two manual links for one endpoint are the user's own business: the later
+    /// one wins, as it did before.
+    #[test]
+    fn a_manual_link_still_updates_a_manual_link() {
+        let mut config = with_locations(vec![server("Home", "home.example", 443)], None);
+        let mut edited = server("Home", "home.example", 443);
+        edited.password = Some("rotated".to_string());
+
+        let outcomes = config.merge(vec![edited], None);
+
+        assert_eq!(outcomes, vec![MergeOutcome::Replaced]);
+        assert_eq!(config.locations.len(), 1);
+        assert_eq!(config.locations[0].server.password.as_deref(), Some("rotated"));
+    }
+
+    #[test]
+    fn an_unknown_identity_is_appended() {
+        let mut config = with_locations(vec![server("Finland", "fi.example", 443)], None);
+        let outcomes = config.merge(vec![server("Japan", "jp.example", 443)], None);
+        assert_eq!(outcomes, vec![MergeOutcome::Added]);
+        assert_eq!(config.locations.len(), 2);
     }
 
     #[test]
