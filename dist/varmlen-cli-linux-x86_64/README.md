@@ -111,7 +111,11 @@ varmlen-cli split apps clear
 
 `selective` tunnels only what is listed; `general` tunnels everything except
 what is listed. The two lists carry independent modes, and `split` prints which
-way each one currently points.
+way each one currently points. Either list in `selective` mode makes the default
+direct: only the listed applications and the listed sites use the VPN.
+
+An edit made while connected reconnects the tunnel with the new rules, as the
+desktop client does; the kill switch, when on, holds across the gap.
 
 A site is either an exact host (`example.com`) or a suffix covering its
 subdomains (`*.example.com`). Since `*` is a glob the shell expands first, the
@@ -163,6 +167,22 @@ varmlen-cli sub list
 varmlen-cli sub update AegisVPN
 varmlen-cli sub remove 2
 ```
+
+`sub update` makes a subscription's locations exactly what the provider sends
+now, as the desktop client does: a location the provider dropped goes, a new
+one appears, and locations of other subscriptions or added by hand are never
+touched, even when they share an endpoint. An update that fails, or that comes
+back empty, keeps the previous locations and records why; `sub list` shows it.
+The location last connected to stays chosen when the provider renames it or
+moves it to another host, and is reported gone rather than swapped for another
+one when it disappears. `sub remove` takes the subscription's locations with it.
+
+`remove` takes away a location added by hand (`remove 3`, `remove Mine`) or a
+whole subscription with its locations (`remove AegisVPN`, `remove sub 2`, the
+same as `sub remove 2`). A single location inside a subscription cannot be
+removed: it belongs to the provider, and the next update would bring it back.
+A name that fits both a location and a subscription is refused rather than
+guessed; the number or `sub` settles it.
 
 A subscription URL's path *is* the account token — anyone holding it can pull
 the account's servers — and terminal output gets screenshotted and pasted into
