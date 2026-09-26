@@ -38,7 +38,8 @@ systemd unit `varmlen-cli@<uid>`.
 
 The installer verifies the release archive against the SHA-256 checksums
 published with it before unpacking anything, and refuses to continue on a
-mismatch. `VARMLEN_VERSION=v0.1.2` pins a specific release.
+mismatch. It installs the newest release, previews included;
+`VARMLEN_VERSION=v0.1.2` pins a specific one.
 
 Reinstalling updates the client; a daemon that is already running keeps
 answering from the files it started with, which is how an upgrade ends up
