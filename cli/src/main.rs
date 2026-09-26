@@ -36,7 +36,7 @@ use varmlend::protocol::{
     DaemonErrorCode, DaemonState, ProxyPingRequest, TcpPingRequest,
 };
 
-use config::{Config, Subscription};
+use config::{Config, Removal, Subscription};
 use display::{bold, bytes, date, dim, label, redacted_url};
 
 #[derive(Parser)]
@@ -74,7 +74,10 @@ enum Command {
     List,
     /// Add a location from a vless:// / vmess:// / trojan:// / ss:// URI.
     Add { uri: String },
-    /// Remove a location by its number from `list`, or by name.
+    /// Remove a location added by hand (its number from `list`, or its name),
+    /// or a subscription with all its locations (`remove sub <number|name>`,
+    /// or just its name). A location inside a subscription cannot be removed
+    /// on its own: the next update would bring it back.
     Remove {
         #[arg(num_args = 1.., required = true)]
         name: Vec<String>,
@@ -291,18 +294,7 @@ async fn run() -> Result<()> {
             config.save()?;
             println!("added {}", display::label(&label, config.settings.emoji));
         }
-        Command::Remove { name } => {
-            let index = config
-                .find(name.join(" ").trim())
-                .map_err(anyhow::Error::msg)?;
-            if config.is_active(index) {
-                config.clear_active();
-            }
-            let removed = config.locations.remove(index);
-            let name = label(&removed.server.label, config.settings.emoji);
-            config.save()?;
-            println!("removed {name}");
-        }
+        Command::Remove { name } => remove(&mut config, &name.join(" "))?,
         Command::Sub(command) => subscriptions(&mut config, command).await?,
         Command::Log { clear } => {
             let command = if clear {
@@ -531,38 +523,36 @@ async fn connect(config: &mut Config, name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a subscription by its number in `sub list` or by name, so nobody has
-/// to paste a URL that carries their token just to name one.
 fn find_subscription(config: &Config, needle: &str) -> Result<usize> {
-    if let Ok(number) = needle.parse::<usize>() {
-        return number
-            .checked_sub(1)
-            .filter(|index| *index < config.subscriptions.len())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no subscription {number}; there are {}",
-                    config.subscriptions.len()
-                )
-            });
+    config.find_subscription(needle).map_err(anyhow::Error::msg)
+}
+
+/// `remove`: a location added by hand, or a subscription with its locations.
+fn remove(config: &mut Config, target: &str) -> Result<()> {
+    match config.removal(target).map_err(anyhow::Error::msg)? {
+        Removal::Location(index) => {
+            if config.is_active(index) {
+                config.clear_active();
+            }
+            let removed = config.locations.remove(index);
+            config.save()?;
+            println!("removed {}", label(&removed.server.label, config.settings.emoji));
+        }
+        Removal::Subscription(index) => remove_subscription(config, index)?,
     }
-    let lowered = needle.to_lowercase();
-    let matches: Vec<usize> = config
-        .subscriptions
-        .iter()
-        .enumerate()
-        .filter(|(_, sub)| {
-            sub.display_name().to_lowercase().contains(&lowered) || sub.url == needle
-        })
-        .map(|(index, _)| index)
-        .collect();
-    match matches.as_slice() {
-        [index] => Ok(*index),
-        [] => bail!("no subscription matches {needle:?}"),
-        many => bail!(
-            "{needle:?} matches {} subscriptions — select by number",
-            many.len()
-        ),
-    }
+    Ok(())
+}
+
+fn remove_subscription(config: &mut Config, index: usize) -> Result<()> {
+    let before = config.locations.len();
+    let removed = config.remove_subscription(index);
+    config.save()?;
+    println!(
+        "removed {} and its {} location(s)",
+        removed.display_name(),
+        before - config.locations.len()
+    );
+    Ok(())
 }
 
 async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
@@ -680,9 +670,7 @@ async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
         }
         SubCommand::Remove { name } => {
             let index = find_subscription(config, name.join(" ").trim())?;
-            let removed = config.remove_subscription(index);
-            config.save()?;
-            println!("removed {} and its locations", removed.display_name());
+            remove_subscription(config, index)?;
         }
     }
     Ok(())

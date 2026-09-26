@@ -83,6 +83,15 @@ fn endpoint(server: &VlessServer) -> (u16, [&str; 12]) {
     )
 }
 
+/// What `remove` takes away; see [`Config::removal`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum Removal {
+    /// A location added by hand, by position in `locations`.
+    Location(usize),
+    /// A subscription with all its locations, by position in `subscriptions`.
+    Subscription(usize),
+}
+
 /// `active` as stored on disk. Pre-0.2 wrote a bare display name; both forms
 /// are read, only the structured one is written back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,26 +336,137 @@ impl Config {
                 )),
             };
         }
+        let matches = self.matching(needle, |_| true);
+        if matches.is_empty() {
+            return Err(format!("no location matches {needle:?}"));
+        }
+        self.single(matches, needle)
+    }
+
+    /// Locations within `scope` whose label matches `needle`, from the most
+    /// specific way of matching that finds any: the exact label, a prefix past
+    /// the flag, then a substring.
+    fn matching(&self, needle: &str, scope: impl Fn(&Location) -> bool) -> Vec<usize> {
         let exact: Vec<usize> = self
-            .positions(|location| location.server.label == needle)
+            .positions(|location| scope(location) && location.server.label == needle)
             .collect();
         if !exact.is_empty() {
-            return self.single(exact, needle);
+            return exact;
         }
         let lowered = needle.to_lowercase();
         let prefixed: Vec<usize> = self
-            .positions(|location| searchable(&location.server.label).starts_with(&lowered))
+            .positions(|location| {
+                scope(location) && searchable(&location.server.label).starts_with(&lowered)
+            })
             .collect();
         if !prefixed.is_empty() {
-            return self.single(prefixed, needle);
+            return prefixed;
         }
-        let contained: Vec<usize> = self
-            .positions(|location| location.server.label.to_lowercase().contains(&lowered))
-            .collect();
-        if contained.is_empty() {
-            return Err(format!("no location matches {needle:?}"));
+        self.positions(|location| {
+            scope(location) && location.server.label.to_lowercase().contains(&lowered)
+        })
+        .collect()
+    }
+
+    /// Resolve a subscription by its number in `sub list` or by name, so nobody
+    /// has to paste a URL that carries their token just to name one.
+    pub fn find_subscription(&self, needle: &str) -> Result<usize, String> {
+        if let Ok(number) = needle.parse::<usize>() {
+            return number
+                .checked_sub(1)
+                .filter(|index| *index < self.subscriptions.len())
+                .ok_or_else(|| {
+                    format!(
+                        "no subscription {number}; there are {}",
+                        self.subscriptions.len()
+                    )
+                });
         }
-        self.single(contained, needle)
+        match self.subscription_matches(needle).as_slice() {
+            [index] => Ok(*index),
+            [] => Err(format!("no subscription matches {needle:?}")),
+            many => Err(format!(
+                "{needle:?} matches {} subscriptions — select by number",
+                many.len()
+            )),
+        }
+    }
+
+    fn subscription_matches(&self, needle: &str) -> Vec<usize> {
+        let lowered = needle.to_lowercase();
+        self.subscriptions
+            .iter()
+            .enumerate()
+            .filter(|(_, sub)| {
+                sub.display_name().to_lowercase().contains(&lowered) || sub.url == needle
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// What `remove <target>` takes away. A location added by hand or a whole
+    /// subscription, never one location out of a subscription: that belongs to
+    /// the provider and the next update would bring it back, so the desktop
+    /// client does not delete it either.
+    ///
+    /// A number is a location from `list`; `sub <number|name>` is a
+    /// subscription from `sub list`; a bare name may be either, and is refused
+    /// when it would be both rather than guessing which one goes.
+    pub fn removal(&self, target: &str) -> Result<Removal, String> {
+        let target = target.trim();
+        if target == "sub" {
+            return Err("name a subscription: `remove sub <number|name>`, or see `sub list`".into());
+        }
+        if let Some(rest) = target.strip_prefix("sub ") {
+            return self.find_subscription(rest.trim()).map(Removal::Subscription);
+        }
+        if target.parse::<usize>().is_ok() {
+            let index = self.find(target)?;
+            return self.manual_only(index).map(Removal::Location);
+        }
+
+        let manual = self.matching(target, |location| location.source.is_none());
+        let subscriptions = self.subscription_matches(target);
+        match (manual.is_empty(), subscriptions.as_slice()) {
+            (false, [_, ..]) => Err(format!(
+                "{target:?} names both a location added by hand and a subscription — \
+                 `remove <number>` for the location (see `list`), `remove sub {target}` \
+                 for the subscription"
+            )),
+            (false, []) => self.single(manual, target).map(Removal::Location),
+            (true, [index]) => Ok(Removal::Subscription(*index)),
+            (true, [_, _, ..]) => Err(format!(
+                "{target:?} matches {} subscriptions — select by number: \
+                 `remove sub <number>`, see `sub list`",
+                subscriptions.len()
+            )),
+            (true, []) => {
+                match self.matching(target, |location| location.source.is_some()).first() {
+                    Some(index) => self.manual_only(*index).map(Removal::Location),
+                    None => Err(format!(
+                        "no location added by hand or subscription matches {target:?}"
+                    )),
+                }
+            }
+        }
+    }
+
+    /// `index` when it is a location added by hand; otherwise why it cannot be
+    /// removed on its own, and what can be.
+    fn manual_only(&self, index: usize) -> Result<usize, String> {
+        let Some(url) = &self.locations[index].source else {
+            return Ok(index);
+        };
+        let label = &self.locations[index].server.label;
+        Err(match self.subscriptions.iter().position(|sub| &sub.url == url) {
+            Some(sub) => format!(
+                "{label:?} comes from the subscription {}, and its next update would bring \
+                 it back; remove the whole subscription with `remove sub {}`",
+                self.subscriptions[sub].display_name(),
+                sub + 1
+            ),
+            None => format!("{label:?} comes from a subscription and cannot be removed on its own"),
+        })
     }
 
     fn positions<'a>(
@@ -819,6 +939,47 @@ mod tests {
         assert_eq!(config.locations[0].source, None);
         assert_eq!(config.locations[1].source.as_deref(), Some(B));
         assert_eq!(config.active_source, None);
+    }
+
+    fn titled(mut config: Config) -> Config {
+        config.subscriptions[0].meta.title = Some("AegisVPN".to_string());
+        config.subscriptions[1].meta.title = Some("Proxen".to_string());
+        config
+    }
+
+    #[test]
+    fn remove_takes_a_manual_location_by_number_or_name() {
+        let config = titled(two_subscriptions());
+        assert_eq!(config.removal("3"), Ok(Removal::Location(2)));
+        assert_eq!(config.removal("Manual"), Ok(Removal::Location(2)));
+    }
+
+    #[test]
+    fn remove_refuses_a_location_inside_a_subscription() {
+        let config = titled(two_subscriptions());
+        let by_number = config.removal("2").expect_err("subscription location");
+        assert!(by_number.contains("AegisVPN"), "{by_number}");
+        assert!(by_number.contains("remove sub 1"), "{by_number}");
+        // Only subscriptions carry "Germany", so the name is refused too.
+        assert!(config.removal("Germany").is_err());
+    }
+
+    #[test]
+    fn remove_takes_a_whole_subscription_by_name_or_sub_number() {
+        let config = titled(two_subscriptions());
+        assert_eq!(config.removal("Proxen"), Ok(Removal::Subscription(1)));
+        assert_eq!(config.removal("sub 1"), Ok(Removal::Subscription(0)));
+        assert_eq!(config.removal("sub aegis"), Ok(Removal::Subscription(0)));
+        assert!(config.removal("sub").is_err());
+    }
+
+    #[test]
+    fn remove_does_not_guess_between_a_location_and_a_subscription() {
+        let mut config = titled(two_subscriptions());
+        config.locations[2].server.label = "Proxen backup".to_string();
+        assert!(config.removal("Proxen").is_err());
+        assert_eq!(config.removal("sub Proxen"), Ok(Removal::Subscription(1)));
+        assert_eq!(config.removal("3"), Ok(Removal::Location(2)));
     }
 
     #[test]

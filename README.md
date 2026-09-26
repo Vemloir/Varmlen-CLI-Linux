@@ -173,6 +173,13 @@ The location last connected to stays chosen when the provider renames it or
 moves it to another host, and is reported gone rather than swapped for another
 one when it disappears. `sub remove` takes the subscription's locations with it.
 
+`remove` takes away a location added by hand (`remove 3`, `remove Mine`) or a
+whole subscription with its locations (`remove AegisVPN`, `remove sub 2`, the
+same as `sub remove 2`). A single location inside a subscription cannot be
+removed: it belongs to the provider, and the next update would bring it back.
+A name that fits both a location and a subscription is refused rather than
+guessed; the number or `sub` settles it.
+
 A subscription URL's path *is* the account token — anyone holding it can pull
 the account's servers — and terminal output gets screenshotted and pasted into
 bug reports. `sub list --reveal` prints the full URLs when you actually need
