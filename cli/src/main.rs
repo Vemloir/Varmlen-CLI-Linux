@@ -36,7 +36,7 @@ use varmlend::protocol::{
     DaemonErrorCode, DaemonState, ProxyPingRequest, TcpPingRequest,
 };
 
-use config::{location_key, Config, Location, Subscription};
+use config::{Config, Subscription};
 use display::{bold, bytes, date, dim, label, redacted_url};
 
 #[derive(Parser)]
@@ -146,8 +146,8 @@ enum SubCommand {
     },
     /// Measure latency to every location in a subscription.
     Ping(PingArgs),
-    /// Remove a subscription by number from `sub list` or by name. Its
-    /// locations are kept.
+    /// Remove a subscription by number from `sub list` or by name, together
+    /// with its locations.
     Remove {
         #[arg(num_args = 1.., required = true)]
         name: Vec<String>,
@@ -287,7 +287,7 @@ async fn run() -> Result<()> {
         Command::Add { uri } => {
             let server = parse_proxy_uri(&uri).map_err(|error| anyhow::anyhow!("{error}"))?;
             let label = server.label.clone();
-            merge(&mut config, vec![server], None);
+            config.add_manual(server);
             config.save()?;
             println!("added {}", display::label(&label, config.settings.emoji));
         }
@@ -295,10 +295,10 @@ async fn run() -> Result<()> {
             let index = config
                 .find(name.join(" ").trim())
                 .map_err(anyhow::Error::msg)?;
-            let removed = config.locations.remove(index);
-            if config.is_active(&removed.server) {
-                config.active = None;
+            if config.is_active(index) {
+                config.clear_active();
             }
+            let removed = config.locations.remove(index);
             let name = label(&removed.server.label, config.settings.emoji);
             config.save()?;
             println!("removed {name}");
@@ -474,7 +474,7 @@ async fn connect(config: &mut Config, name: Option<&str>) -> Result<()> {
     };
     // Naming a location is also choosing it: a later bare `connect` reuses it.
     if name.is_some() {
-        let chosen = config.locations[index].server.clone();
+        let chosen = config.locations[index].clone();
         config.set_active(&chosen);
         config.save()?;
     }
@@ -574,13 +574,17 @@ async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
             let result = fetch_subscription(url.clone(), config.settings.user_agent.clone())
                 .await
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
+            if result.servers.is_empty() {
+                bail!("no locations found in this subscription");
+            }
             let count = result.servers.len();
-            merge(config, result.servers, Some(&url));
             config.subscriptions.push(Subscription {
-                url,
+                url: url.clone(),
                 meta: result.meta,
                 description: result.description,
+                last_error: None,
             });
+            config.replace_subscription_locations(&url, result.servers);
             config.save()?;
             println!("imported {count} location(s)");
         }
@@ -609,6 +613,9 @@ async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
                             .count()
                     ))
                 );
+                if let Some(error) = &sub.last_error {
+                    println!("{}", dim(&format!("     last update failed: {error}")));
+                }
             }
         }
         SubCommand::Update { name } => {
@@ -622,31 +629,60 @@ async fn subscriptions(config: &mut Config, command: SubCommand) -> Result<()> {
             if urls.is_empty() {
                 bail!("no subscriptions configured");
             }
+            // Each subscription stands on its own, as in the desktop client: one
+            // provider being down neither stops the others from updating nor
+            // costs its own locations — a failed update keeps what the previous
+            // one left and records why.
+            let total = urls.len();
+            let mut failed = 0;
             for url in urls {
-                let result = fetch_subscription(url.clone(), config.settings.user_agent.clone())
+                let outcome = fetch_subscription(url.clone(), config.settings.user_agent.clone())
                     .await
-                    .map_err(|error| anyhow::anyhow!("updating {}: {error}", redacted_url(&url)))?;
-                let count = result.servers.len();
-                merge(config, result.servers, Some(&url));
-                if let Some(sub) = config.subscriptions.iter_mut().find(|s| s.url == url) {
-                    sub.meta = result.meta;
-                    sub.description = result.description;
+                    .map_err(|error| describe_error(&error.to_string(), &url))
+                    .and_then(|result| {
+                        if result.servers.is_empty() {
+                            Err(config::NO_LOCATIONS_ERROR.to_string())
+                        } else {
+                            Ok(result)
+                        }
+                    });
+                let Some(index) = config.subscriptions.iter().position(|s| s.url == url) else {
+                    continue;
+                };
+                match outcome {
+                    Ok(result) => {
+                        let count = result.servers.len();
+                        let (added, removed) =
+                            config.replace_subscription_locations(&url, result.servers);
+                        let sub = &mut config.subscriptions[index];
+                        sub.apply_update(result.meta, result.description);
+                        let mut line = format!("{}: {count} location(s)", sub.display_name());
+                        if added > 0 || removed > 0 {
+                            line.push_str(&dim(&format!("  +{added} −{removed}")));
+                        }
+                        println!("{line}");
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        let sub = &mut config.subscriptions[index];
+                        eprintln!(
+                            "{}: update failed, keeping the previous locations: {error}",
+                            sub.display_name()
+                        );
+                        sub.last_error = Some(error);
+                    }
                 }
-                let name = config
-                    .subscriptions
-                    .iter()
-                    .find(|s| s.url == url)
-                    .map(|s| s.display_name())
-                    .unwrap_or_else(|| redacted_url(&url));
-                println!("{name}: {count} location(s)");
             }
             config.save()?;
+            if failed > 0 {
+                bail!("{failed} of {total} subscription(s) failed to update");
+            }
         }
         SubCommand::Remove { name } => {
             let index = find_subscription(config, name.join(" ").trim())?;
-            let removed = config.subscriptions.remove(index);
+            let removed = config.remove_subscription(index);
             config.save()?;
-            println!("removed {}", removed.display_name());
+            println!("removed {} and its locations", removed.display_name());
         }
     }
     Ok(())
@@ -1046,28 +1082,21 @@ fn print_split(split: &SplitInput, only: Option<Section>) {
     }
 }
 
-/// Refresh locations that came back with the same identity, add the rest.
-///
-/// Keyed on `location_key` rather than the display name: providers reuse names
-/// across locations, and matching on one would collapse distinct servers into
-/// a single entry.
-fn merge(config: &mut Config, incoming: Vec<VlessServer>, source: Option<&str>) {
-    for server in incoming {
-        let key = location_key(&server);
-        match config
-            .locations
-            .iter_mut()
-            .find(|existing| location_key(&existing.server) == key)
-        {
-            Some(existing) => {
-                existing.server = server;
-                existing.source = source.map(str::to_string);
-            }
-            None => config.locations.push(Location {
-                server,
-                source: source.map(str::to_string),
-            }),
-        }
+/// A failed update as it is kept on the subscription and shown in listings:
+/// without the URL, which carries the account token, and short enough for one
+/// line.
+fn describe_error(error: &str, url: &str) -> String {
+    let text = error.replace(url, "<subscription>");
+    let text = text.trim();
+    let text = if text.is_empty() {
+        "unknown error"
+    } else {
+        text
+    };
+    if text.chars().count() > 180 {
+        format!("{}...", text.chars().take(177).collect::<String>())
+    } else {
+        text.to_string()
     }
 }
 
@@ -1172,11 +1201,14 @@ fn print_subscription(subscription: &Subscription) {
             println!("{}", dim(&format!("  {caption}: {url}")));
         }
     }
+    if let Some(error) = &subscription.last_error {
+        println!("{}", dim(&format!("  last update failed: {error}")));
+    }
 }
 
 fn print_location(config: &Config, index: usize, duplicated: &[&str]) {
     let server = &config.locations[index].server;
-    let marker = if config.is_active(server) { "*" } else { " " };
+    let marker = if config.is_active(index) { "*" } else { " " };
     println!(
         "{marker} {:>3}  {}",
         index + 1,

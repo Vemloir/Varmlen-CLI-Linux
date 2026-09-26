@@ -164,6 +164,15 @@ varmlen-cli sub update AegisVPN
 varmlen-cli sub remove 2
 ```
 
+`sub update` makes a subscription's locations exactly what the provider sends
+now, as the desktop client does: a location the provider dropped goes, a new
+one appears, and locations of other subscriptions or added by hand are never
+touched, even when they share an endpoint. An update that fails, or that comes
+back empty, keeps the previous locations and records why; `sub list` shows it.
+The location last connected to stays chosen when the provider renames it or
+moves it to another host, and is reported gone rather than swapped for another
+one when it disappears. `sub remove` takes the subscription's locations with it.
+
 A subscription URL's path *is* the account token — anyone holding it can pull
 the account's servers — and terminal output gets screenshotted and pasted into
 bug reports. `sub list --reveal` prints the full URLs when you actually need
