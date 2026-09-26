@@ -363,6 +363,13 @@ impl SplitBackend for SystemSplitBackend {
         Ok(())
     }
 
+    async fn refresh_route_rules(&mut self) -> Result<(), SplitError> {
+        let route = detect_default_route().await?;
+        install_routing(&self.cgroup()?.relative_path(), &route).await?;
+        self.routing_active = true;
+        Ok(())
+    }
+
     async fn rollback(&mut self) -> Result<(), SplitError> {
         self.stop_reconciler();
         self.watcher.take();

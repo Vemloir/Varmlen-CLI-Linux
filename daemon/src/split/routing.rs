@@ -95,30 +95,94 @@ pub async fn detect_default_route() -> Result<PhysicalRoute, SplitError> {
         .ok_or(SplitError::RoutingUnavailable)
 }
 
-pub async fn install_routing(
-    cgroup_relative: &str,
-    route: &PhysicalRoute,
-) -> Result<(), SplitError> {
+/// The routing table and policy-rule priority owned by the per-app split.
+///
+/// Table 100 belongs to the network helper: it carries the physical default
+/// route that Xray's own dials (mark 0x2024) leave by. Sharing it meant that
+/// tearing the split down — clearing the last excluded application, switching
+/// the applications to selective mode, or reconnecting with a changed list —
+/// flushed that route while the tunnel stayed up, and every direct outbound of
+/// Xray looped back into its own tun.
+pub const SPLIT_TABLE: &str = "102";
+pub const SPLIT_RULE_PRIORITY: &str = "100";
+
+/// Destinations that must leave by the main table even from a bypassed
+/// socket: a physical default would send LAN traffic to the gateway.
+const LOCAL_THROWS: [&str; 7] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "100.64.0.0/10",
+    "224.0.0.0/4",
+    "255.255.255.255/32",
+];
+
+/// `ip` invocations that lay the split's own table and rule, in order.
+pub fn routing_setup_commands(route: &PhysicalRoute) -> Vec<Vec<String>> {
+    let owned = |items: &[&str]| items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
     let mut default = vec!["route", "replace", "default"];
     if let Some(gateway) = route.gateway.as_deref() {
         default.extend(["via", gateway]);
     }
-    default.extend(["dev", &route.interface, "table", "100"]);
-    run_ip(&default).await?;
-    let _ = run_ip(&["rule", "del", "fwmark", "0x2025", "lookup", "100"]).await;
-    run_ip(&[
-        "rule", "add", "priority", "100", "fwmark", "0x2025", "lookup", "100",
-    ])
-    .await?;
+    default.extend(["dev", &route.interface, "table", SPLIT_TABLE]);
+    let mut commands = vec![owned(&default)];
+    for network in LOCAL_THROWS {
+        commands.push(owned(&["route", "replace", "throw", network, "table", SPLIT_TABLE]));
+    }
+    commands.push(owned(&[
+        "rule",
+        "add",
+        "priority",
+        SPLIT_RULE_PRIORITY,
+        "fwmark",
+        "0x2025",
+        "lookup",
+        SPLIT_TABLE,
+    ]));
+    commands
+}
+
+/// `ip` invocations that remove only what the split laid. Nothing here names
+/// table 100 or a rule the helper owns.
+pub fn routing_teardown_commands() -> Vec<Vec<String>> {
+    let owned = |items: &[&str]| items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+    vec![
+        owned(&[
+            "rule",
+            "del",
+            "priority",
+            SPLIT_RULE_PRIORITY,
+            "fwmark",
+            "0x2025",
+            "lookup",
+            SPLIT_TABLE,
+        ]),
+        owned(&["route", "flush", "table", SPLIT_TABLE]),
+    ]
+}
+
+pub async fn install_routing(
+    cgroup_relative: &str,
+    route: &PhysicalRoute,
+) -> Result<(), SplitError> {
     let rules = render_split_rules(cgroup_relative, route)?;
+    // Idempotent: a refresh after a reconnect lays the same state again.
+    for command in routing_teardown_commands() {
+        let _ = run_ip(&command).await;
+    }
+    for command in routing_setup_commands(route) {
+        run_ip(&command).await?;
+    }
     apply_ruleset_with_code(&rules, DaemonErrorCode::Internal)
         .await
         .map_err(|_| SplitError::RoutingUnavailable)
 }
 
 pub async fn remove_routing() -> Result<(), SplitError> {
-    let _ = run_ip(&["rule", "del", "fwmark", "0x2025", "lookup", "100"]).await;
-    let _ = run_ip(&["route", "flush", "table", "100"]).await;
+    for command in routing_teardown_commands() {
+        let _ = run_ip(&command).await;
+    }
     let output = Command::new("nft")
         .args(["delete", "table", "inet", "varmlen_split"])
         .stdout(Stdio::null())
@@ -134,7 +198,7 @@ pub async fn remove_routing() -> Result<(), SplitError> {
     }
 }
 
-async fn run_ip(arguments: &[&str]) -> Result<(), SplitError> {
+async fn run_ip<S: AsRef<std::ffi::OsStr>>(arguments: &[S]) -> Result<(), SplitError> {
     let output = Command::new("ip")
         .args(arguments)
         .stdout(Stdio::null())
@@ -151,7 +215,45 @@ async fn run_ip(arguments: &[&str]) -> Result<(), SplitError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_default_route, render_split_rules, PhysicalRoute};
+    use super::{
+        parse_default_route, render_split_rules, routing_setup_commands,
+        routing_teardown_commands, PhysicalRoute,
+    };
+
+    fn joined(commands: Vec<Vec<String>>) -> Vec<String> {
+        commands.into_iter().map(|command| command.join(" ")).collect()
+    }
+
+    #[test]
+    fn the_split_never_touches_the_helpers_table() {
+        let route = PhysicalRoute {
+            interface: "enp11s0".into(),
+            gateway: Some("192.168.1.1".into()),
+        };
+        let all = [
+            joined(routing_setup_commands(&route)),
+            joined(routing_teardown_commands()),
+        ]
+        .concat();
+        // Table 100 carries Xray's own direct dials; flushing it while the
+        // tunnel is up loops them back into the tun.
+        assert!(all.iter().all(|command| !command.contains("table 100")
+            && !command.contains("lookup 100")));
+        assert!(all.contains(&"route flush table 102".to_string()));
+        assert!(all.contains(&"rule del priority 100 fwmark 0x2025 lookup 102".to_string()));
+    }
+
+    #[test]
+    fn local_networks_are_thrown_back_to_the_main_table() {
+        let route = PhysicalRoute {
+            interface: "wwan0".into(),
+            gateway: None,
+        };
+        let setup = joined(routing_setup_commands(&route));
+        assert_eq!(setup[0], "route replace default dev wwan0 table 102");
+        assert!(setup.contains(&"route replace throw 192.168.0.0/16 table 102".to_string()));
+        assert_eq!(setup.last().unwrap(), "rule add priority 100 fwmark 0x2025 lookup 102");
+    }
 
     #[test]
     fn generic_marking_covers_tcp_and_udp_without_protocol_filter() {

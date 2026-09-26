@@ -1378,14 +1378,13 @@ fn build_route_rules(
     let sites_use_proxy = sites_selective;
     let default_uses_proxy = if !supports_process_split {
         !sites_selective
-    } else if apps_selective {
-        // Selective apps mode = ONLY the listed apps use the VPN; everything else
-        // (e.g. a game that isn't in the list) stays DIRECT. The apps choice owns
-        // the default. (Previously this defaulted to "proxy" unless the sites mode
-        // was ALSO selective, so non-listed apps wrongly went through the VPN.)
-        false
     } else {
-        true
+        // Either list in selective mode means only what it names uses the
+        // VPN, so everything else stays DIRECT. The two whitelists add up:
+        // their proxy rules sit above this default. (The apps choice alone used to own the default, so a selective website list
+        // with the applications in general mode sent everything through the
+        // VPN and the list did nothing.)
+        !(apps_selective || sites_selective)
     };
 
     let mut rules = vec![
@@ -2584,6 +2583,24 @@ mod tests {
         assert_eq!(proc_rule["process"][0], "firefox");
         assert_eq!(proc_rule["outboundTag"], "proxy"); // whitelisted app tunnels
         assert_eq!(rule_for(&cfg, "domain").unwrap()["outboundTag"], "proxy");
+    }
+
+    #[test]
+    fn selective_sites_are_honoured_with_apps_in_general_mode() {
+        // The applications' default mode must not swallow a website whitelist:
+        // only the listed site uses the VPN, an excluded app still goes direct.
+        let s = parse_proxy_uri("vless://u@1.2.3.4:443?security=reality&pbk=K#X").unwrap();
+        let sp = SplitInput {
+            apps_mode: "general".into(),
+            sites_mode: "selective".into(),
+            apps: vec!["steam".into()],
+            sites: vec!["example.com".into()],
+        };
+        let cfg = build_xray_config(&s, &sp, "tun", TunMode::XrayNative, true, "warning", TUN_MTU);
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules.last().unwrap()["outboundTag"], "direct");
+        assert_eq!(rule_for(&cfg, "domain").unwrap()["outboundTag"], "proxy");
+        assert_eq!(rule_for(&cfg, "process").unwrap()["outboundTag"], "direct");
     }
 
     #[test]

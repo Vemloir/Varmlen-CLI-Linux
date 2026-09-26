@@ -32,7 +32,7 @@ use varmlen_core::xray::{
     build_connection_probe_config, build_ping_config, generate_xray_config, ping_placeholder_ports,
 };
 use varmlend::protocol::{
-    ApplicationsRequest, ConnectRequest, ConnectionMode, ConnectionPhase, DaemonCommand,
+    ConnectRequest, ConnectionMode, ConnectionPhase, DaemonCommand,
     DaemonErrorCode, DaemonState, ProxyPingRequest, TcpPingRequest,
 };
 
@@ -321,9 +321,7 @@ async fn run() -> Result<()> {
                 Some(action) => {
                     let section = split(&mut config, action)?;
                     config.save()?;
-                    if section == Section::Apps {
-                        apply_split_live(&config).await;
-                    }
+                    apply_split_live(&mut config).await?;
                     Some(section)
                 }
                 None => None,
@@ -340,34 +338,30 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Hand an edited app list to a tunnel that is already up.
+/// Bring an edited split to a tunnel that is already up, as the desktop
+/// client does: by reconnecting with the regenerated configuration.
 ///
-/// Split rules used to be read at connect only, so `split apps add` looked like
-/// it had done nothing until the tunnel was cycled, and a rule that had been
-/// removed kept the application going direct.  Not being connected, or a
-/// daemon that predates this command, is normal here: the list is applied when
-/// the tunnel comes up, which is what the line says.
-async fn apply_split_live(config: &Config) {
-    let applications = if config.split.apps_selective() {
-        Vec::new()
-    } else {
-        config.split.enabled_apps()
+/// Handing the daemon the new application list alone was not enough. The
+/// listed applications also live in Xray's own routing rules, which only a
+/// connect writes, so an application taken out of the exceptions kept going
+/// direct, a change to a selective list did nothing, and websites were never
+/// applied at all until the next connect. The kill switch, when on, holds
+/// across the reconnect.
+async fn apply_split_live(config: &mut Config) -> Result<()> {
+    let connected = match DaemonClient::connect_installed().await {
+        Ok(mut client) => client
+            .request(DaemonCommand::Status)
+            .await
+            .is_ok_and(|state| state.phase == ConnectionPhase::Connected),
+        Err(_) => false,
     };
-    let note = match daemon().await {
-        Err(error) => format!("will apply on connect: {error}"),
-        Ok(mut client) => {
-            match client
-                .request(DaemonCommand::UpdateSplit(ApplicationsRequest {
-                    applications,
-                }))
-                .await
-            {
-                Ok(_) => "applied to the running tunnel".to_string(),
-                Err(error) => format!("will apply on connect: {error}"),
-            }
-        }
-    };
-    println!("{}", dim(&note));
+    if !connected {
+        println!("{}", dim("will apply on connect"));
+        return Ok(());
+    }
+    connect(config, None)
+        .await
+        .context("applying the split to the running tunnel")
 }
 
 /// Replace a daemon that is older than this client.

@@ -59,6 +59,10 @@ pub trait SplitBackend {
     /// exception list look inert: the application keeps bypassing, or keeps
     /// not bypassing, until the tunnel is cycled.
     async fn update_plan(&mut self, plan: &SplitPlan) -> Result<(), SplitError>;
+    /// Lay the split's routing again. A reconnect keeps the split but the
+    /// helper's `route-down` removes every policy rule on the split's mark,
+    /// and the physical default route may have changed meanwhile.
+    async fn refresh_route_rules(&mut self) -> Result<(), SplitError>;
     async fn rollback(&mut self) -> Result<(), SplitError>;
 }
 
@@ -117,6 +121,14 @@ impl<B: SplitBackend> SplitManager<B> {
         self.backend.update_plan(&plan).await?;
         Ok(true)
     }
+
+    /// Re-lay a live split's routing after the tunnel under it was rebuilt.
+    pub async fn refresh_routing(&mut self) -> Result<(), SplitError> {
+        if !matches!(self.status, SplitStatus::Active) {
+            return Ok(());
+        }
+        self.backend.refresh_route_rules().await
+    }
 }
 
 #[cfg(test)]
@@ -165,6 +177,11 @@ mod tests {
 
         async fn update_plan(&mut self, plan: &SplitPlan) -> Result<(), SplitError> {
             self.plans.push(plan.clone());
+            Ok(())
+        }
+
+        async fn refresh_route_rules(&mut self) -> Result<(), SplitError> {
+            self.routes_installed = true;
             Ok(())
         }
 

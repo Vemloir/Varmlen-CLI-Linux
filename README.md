@@ -111,7 +111,11 @@ varmlen-cli split apps clear
 
 `selective` tunnels only what is listed; `general` tunnels everything except
 what is listed. The two lists carry independent modes, and `split` prints which
-way each one currently points.
+way each one currently points. Either list in `selective` mode makes the default
+direct: only the listed applications and the listed sites use the VPN.
+
+An edit made while connected reconnects the tunnel with the new rules, as the
+desktop client does; the kill switch, when on, holds across the gap.
 
 A site is either an exact host (`example.com`) or a suffix covering its
 subdomains (`*.example.com`). Since `*` is a glob the shell expands first, the

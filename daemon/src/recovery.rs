@@ -115,10 +115,20 @@ fn route_resources(rules_text: &str, routes_text: &str) -> BTreeSet<Resource> {
     if rules_text.contains("0x2023") || rules_text.contains("0x00002023") {
         resources.insert(Resource::RouteTable("101".into()));
     }
-    if rules_text.contains("0x2024")
-        || rules_text.contains("0x00002024")
-        || rules_text.contains("0x2025")
-        || rules_text.contains("0x00002025")
+    // The per-app split keeps its own table; its rule must not read as the
+    // helper's, or cleaning table 100 could never make it disappear.
+    let split_table = format!("lookup {}", crate::split::routing::SPLIT_TABLE);
+    let (split_rules, helper_rules): (Vec<&str>, Vec<&str>) = rules_text
+        .lines()
+        .partition(|line| line.contains(&split_table));
+    if !split_rules.is_empty() {
+        resources.insert(Resource::RouteTable(crate::split::routing::SPLIT_TABLE.into()));
+    }
+    let helper_rules = helper_rules.join("\n");
+    if helper_rules.contains("0x2024")
+        || helper_rules.contains("0x00002024")
+        || helper_rules.contains("0x2025")
+        || helper_rules.contains("0x00002025")
         || routes_text.contains("0.0.0.0/1")
         || routes_text.contains("128.0.0.0/1")
         || routes_text.contains("blackhole ::/1")
@@ -197,6 +207,13 @@ impl CleanupBackend for SystemCleanupBackend {
             Resource::XrayProcess(saved) => terminate_process(saved).await,
             Resource::TunInterface(interface) if interface == "varmlen0" => {
                 command_success("ip", &["link", "delete", "dev", interface]).await
+            }
+            Resource::RouteTable(table) if table == crate::split::routing::SPLIT_TABLE => {
+                for command in crate::split::routing::routing_teardown_commands() {
+                    let arguments: Vec<&str> = command.iter().map(String::as_str).collect();
+                    let _ = command_success("ip", &arguments).await;
+                }
+                Ok(())
             }
             Resource::RouteTable(table) if matches!(table.as_str(), "100" | "101") => {
                 if table == "100" {
@@ -366,6 +383,23 @@ mod tests {
         assert_eq!(
             resources,
             BTreeSet::from([Resource::RouteTable("101".into())])
+        );
+    }
+
+    #[test]
+    fn the_split_table_is_recovered_on_its_own() {
+        let resources = route_resources("100: from all fwmark 0x2025 lookup 102", "");
+        assert_eq!(resources, BTreeSet::from([Resource::RouteTable("102".into())]));
+        let resources = route_resources(
+            "100: from all fwmark 0x2025 lookup 102\n32765: from all fwmark 0x2025 lookup 100",
+            "",
+        );
+        assert_eq!(
+            resources,
+            BTreeSet::from([
+                Resource::RouteTable("100".into()),
+                Resource::RouteTable("102".into())
+            ])
         );
     }
 

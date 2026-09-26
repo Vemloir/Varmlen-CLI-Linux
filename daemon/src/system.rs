@@ -1108,6 +1108,14 @@ impl LifecycleBackend for SystemLifecycleBackend {
         }
         if !request.excluded_apps.is_empty() && self.split.is_none() {
             self.apply_split(&request.excluded_apps).await?;
+        } else if let Some(split) = self.split.as_mut() {
+            // Kept across a reconnect: `route-down` took its policy rule away.
+            split.refresh_routing().await.map_err(|error| {
+                DaemonError::new(
+                    DaemonErrorCode::SplitUnavailable,
+                    format!("per-app split tunnelling is unavailable: {error}"),
+                )
+            })?;
         }
 
         let mut dns = DnsGuard::new(SystemDnsBackend::new());
