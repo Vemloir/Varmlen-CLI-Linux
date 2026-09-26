@@ -17,7 +17,8 @@
 # daemon: the running process keeps the files it started with.
 #
 # Environment:
-#   VARMLEN_VERSION   install a specific tag (default: the latest release)
+#   VARMLEN_VERSION   install a specific tag (default: the newest release,
+#                     previews included)
 #
 # Source: https://github.com/Vemloir/Varmlen-CLI-Linux   (GPL-3.0-only)
 set -eu
@@ -50,8 +51,11 @@ esac
 command -v systemctl >/dev/null 2>&1 ||
     die "systemd is required: the daemon runs as a systemd service"
 
+# releases/latest skips pre-releases, and the CLI ships its previews as
+# pre-releases, so the newest release is taken from the list instead: GitHub
+# returns it newest first and without drafts.
 if [ -z "$VERSION" ]; then
-    VERSION=$(fetch_stdout "https://api.github.com/repos/$REPO/releases/latest" |
+    VERSION=$(fetch_stdout "https://api.github.com/repos/$REPO/releases?per_page=1" |
         sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
     [ -n "$VERSION" ] || die "could not determine the latest release"
 fi
